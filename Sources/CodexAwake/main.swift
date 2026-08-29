@@ -82,68 +82,9 @@ private final class SleepAssertion {
 
 private enum CodexSessionDetector {
     static func activeSessionCount() -> Int {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/ps")
-        process.arguments = ["-axo", "pid=,tty=,command="]
-
-        let output = Pipe()
-        process.standardOutput = output
-        process.standardError = FileHandle.nullDevice
-
-        do {
-            try process.run()
-            let data = output.fileHandleForReading.readDataToEndOfFile()
-            process.waitUntilExit()
-            guard process.terminationStatus == 0,
-                  let text = String(data: data, encoding: .utf8) else {
-                return 0
-            }
-
-            return text.split(separator: "\n").reduce(into: 0) { count, row in
-                let fields = row.split(maxSplits: 2, whereSeparator: { $0.isWhitespace })
-                guard fields.count == 3,
-                      let pid = Int(fields[0]),
-                      pid != ProcessInfo.processInfo.processIdentifier else {
-                    return
-                }
-
-                let tty = String(fields[1])
-                let command = String(fields[2])
-                guard isInteractiveCodexProcess(tty: tty, command: command) else {
-                    return
-                }
-                count += 1
-            }
-        } catch {
-            return 0
-        }
-    }
-
-    private static func isInteractiveCodexProcess(tty: String, command: String) -> Bool {
-        guard let executable = command.split(whereSeparator: { $0.isWhitespace }).first else {
-            return false
-        }
-
-        let executableName = URL(fileURLWithPath: String(executable)).lastPathComponent
-        guard executableName == "codex" else { return false }
-
-        let lowercased = command.lowercased()
-        let excludedFragments = [
-            "/applications/chatgpt.app/contents/resources/codex",
-            " app-server",
-            " remote-control",
-            " codex-code-mode-host",
-            " mcp-server",
-            " completion",
-            " sandbox",
-            " review",
-            " exec"
-        ]
-        guard !excludedFragments.contains(where: lowercased.contains) else { return false }
-
-        let hasInteractiveTTY = tty != "??" && tty != "?" && tty != "-"
-        let isRemoteTUI = lowercased.contains("--remote") && lowercased.contains("unix://")
-        return hasInteractiveTTY || isRemoteTUI
+        CodexProcessInspector.liveProcesses()
+            .filter { $0.pid != ProcessInfo.processInfo.processIdentifier }
+            .count
     }
 }
 
@@ -162,6 +103,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private let detectorQueue = DispatchQueue(label: "com.stslex.CodexAwake.session-detector", qos: .utility)
     private let remoteQueue = DispatchQueue(label: "com.stslex.CodexAwake.remote", qos: .utility)
     private let relativeDateFormatter = RelativeDateTimeFormatter()
+    private let profileStore = SessionProfileStore()
 
     private var modeItems: [AwakeMode: NSMenuItem] = [:]
     private var activeSessionItems: [NSMenuItem] = []
@@ -331,8 +273,163 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         refreshRemoteAndSessions(force: true)
     }
 
+    @objc private func openSessionInChatGPT(_ sender: NSMenuItem) {
+        guard let session = sender.representedObject as? CodexSession,
+              let url = URL(string: "codex://threads/\(session.id)") else {
+            showError("The ChatGPT thread link could not be created.")
+            return
+        }
+        if !NSWorkspace.shared.open(url) {
+            showError("ChatGPT could not open this session.")
+        }
+    }
+
+    @objc private func resumeSession(_ sender: NSMenuItem) {
+        guard let session = sender.representedObject as? CodexSession else { return }
+        launchSession(session, action: .resume)
+    }
+
+    @objc private func forkSession(_ sender: NSMenuItem) {
+        guard let session = sender.representedObject as? CodexSession else { return }
+        launchSession(session, action: .fork)
+    }
+
+    @objc private func revealWorkingDirectory(_ sender: NSMenuItem) {
+        guard let session = sender.representedObject as? CodexSession else { return }
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: session.cwd, isDirectory: &isDirectory),
+              isDirectory.boolValue else {
+            showError("The working directory no longer exists:\n\(session.cwd)")
+            return
+        }
+        NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: session.cwd)
+    }
+
+    @objc private func copySessionValue(_ sender: NSMenuItem) {
+        guard let value = sender.representedObject as? String else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(value, forType: .string)
+    }
+
+    @objc private func chooseSessionProfile(_ sender: NSMenuItem) {
+        guard let session = sender.representedObject as? CodexSession else { return }
+        _ = promptForProfile(
+            session: session,
+            current: profileStore.profile(for: session.id),
+            confirmationTitle: "Save"
+        )
+        updatePresentation()
+    }
+
+    @objc private func archiveSession(_ sender: NSMenuItem) {
+        guard let session = sender.representedObject as? CodexSession else { return }
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Archive this Codex session?"
+        alert.informativeText = "“\(session.displayName)” will be removed from Recent Sessions. You can unarchive it later with Codex CLI."
+        alert.addButton(withTitle: "Archive")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        remoteQueue.async { [weak self] in
+            let error = CodexRemoteBridge.archiveSession(id: session.id)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if let error {
+                    self.showError(error)
+                } else {
+                    self.refreshRemoteAndSessions(force: true)
+                }
+            }
+        }
+    }
+
     @objc private func quit() {
         NSApp.terminate(nil)
+    }
+
+    private func launchSession(_ session: CodexSession, action: SessionTerminalAction) {
+        let profile: SessionProfile
+        if let storedProfile = profileStore.profile(for: session.id) {
+            profile = storedProfile
+        } else {
+            guard let selectedProfile = promptForProfile(
+                session: session,
+                current: nil,
+                confirmationTitle: action == .resume ? "Resume" : "Fork"
+            ) else {
+                return
+            }
+            profile = selectedProfile
+        }
+
+        guard let executable = CodexRemoteBridge.codexExecutableURL else {
+            showError("Codex CLI was not found.")
+            return
+        }
+        let arguments = CodexSessionCommand.arguments(
+            action: action,
+            sessionID: session.id,
+            profile: profile
+        )
+        let script = CodexSessionCommand.terminalScript(
+            executablePath: executable.path,
+            arguments: arguments,
+            workingDirectory: session.cwd
+        )
+
+        detectorQueue.async { [weak self] in
+            let result = TerminalLauncher.launch(script: script)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if result.terminationStatus != 0 {
+                    self.showError(result.combinedOutput.isEmpty ? "Terminal could not launch Codex." : result.combinedOutput)
+                }
+            }
+        }
+    }
+
+    @discardableResult
+    private func promptForProfile(
+        session: CodexSession,
+        current: SessionProfile?,
+        confirmationTitle: String
+    ) -> SessionProfile? {
+        let choices = CodexRemoteBridge.availableProfiles().map(SessionProfile.named) + [.defaultProfile]
+        let popUp = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 300, height: 28), pullsDown: false)
+        popUp.addItems(withTitles: choices.map(\.displayName))
+        if let current, let index = choices.firstIndex(of: current) {
+            popUp.selectItem(at: index)
+        }
+
+        let alert = NSAlert()
+        alert.messageText = current == nil ? "Choose this session's Codex profile" : "Session profile"
+        alert.informativeText = "Codex does not store the --profile name in thread metadata. Choose the profile originally used by “\(session.displayName)”. Codex Awake will remember it for Resume and Fork."
+        alert.accessoryView = popUp
+        alert.addButton(withTitle: confirmationTitle)
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn,
+              choices.indices.contains(popUp.indexOfSelectedItem) else {
+            return nil
+        }
+
+        let selected = choices[popUp.indexOfSelectedItem]
+        profileStore.set(selected, for: session.id)
+        return selected
+    }
+
+    private func showError(_ message: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Codex Awake"
+        alert.informativeText = message
+        alert.addButton(withTitle: "OK")
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
     }
 
     private func scanForSessions() {
@@ -363,6 +460,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         remoteQueue.async { [weak self] in
             let status = CodexRemoteBridge.ensureRemoteStarted()
             let activeSessions = CodexRemoteBridge.activeSessions(limit: maximumVisibleSessions)
+            let discoveredProfiles = CodexRemoteBridge.discoveredProfiles(for: activeSessions)
             let activeIDs = Set(activeSessions.map(\.id))
             let recentSessions = CodexRemoteBridge
                 .recentSessions(limit: maximumVisibleSessions + activeIDs.count)
@@ -374,6 +472,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                 self.remoteStatus = status
                 self.activeSessions = activeSessions
                 self.recentSessions = Array(recentSessions)
+                for (sessionID, profile) in discoveredProfiles {
+                    self.profileStore.set(profile, for: sessionID)
+                }
                 self.sessionsLoaded = true
                 self.lastRemoteRefresh = Date()
                 self.updatePresentation()
@@ -446,6 +547,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         if !sessionsLoaded {
             activeSessionItems[0].title = "Loading sessions…"
             activeSessionItems[0].toolTip = nil
+            activeSessionItems[0].submenu = nil
+            activeSessionItems[0].isEnabled = false
             activeSessionItems[0].isHidden = false
             for item in activeSessionItems.dropFirst() { item.isHidden = true }
             updateRecentSessionsMenu()
@@ -455,6 +558,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         if activeSessions.isEmpty {
             activeSessionItems[0].title = "No active sessions"
             activeSessionItems[0].toolTip = nil
+            activeSessionItems[0].submenu = nil
+            activeSessionItems[0].isEnabled = false
             activeSessionItems[0].isHidden = false
             for item in activeSessionItems.dropFirst() { item.isHidden = true }
             updateRecentSessionsMenu()
@@ -463,11 +568,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
         for (index, item) in activeSessionItems.enumerated() {
             guard index < activeSessions.count else {
+                item.submenu = nil
+                item.isEnabled = false
                 item.isHidden = true
                 continue
             }
 
-            configureSessionItem(item, session: activeSessions[index])
+            configureSessionItem(item, session: activeSessions[index], isActive: true)
             item.isHidden = false
         }
         updateRecentSessionsMenu()
@@ -490,19 +597,120 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
         for session in recentSessions {
             let item = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-            item.isEnabled = false
+            item.isEnabled = true
             item.image = menuSymbol("clock")
-            configureSessionItem(item, session: session)
+            configureSessionItem(item, session: session, isActive: false)
             recentSessionsMenu.addItem(item)
         }
     }
 
-    private func configureSessionItem(_ item: NSMenuItem, session: CodexSession) {
+    private func configureSessionItem(_ item: NSMenuItem, session: CodexSession, isActive: Bool) {
         let projectName = URL(fileURLWithPath: session.cwd).lastPathComponent
         item.title = "\(compact(session.displayName, maximumLength: 46)) · \(projectName)"
         let date = Date(timeIntervalSince1970: TimeInterval(session.recencyAt))
         let relativeDate = relativeDateFormatter.localizedString(for: date, relativeTo: Date())
-        item.toolTip = "\(session.displayName)\n\(session.cwd)\nUpdated \(relativeDate)\n\(session.id)"
+        let profile = profileStore.profile(for: session.id)?.displayName ?? "Unknown profile"
+        item.toolTip = "\(session.displayName)\n\(session.cwd)\nProfile: \(profile)\nUpdated \(relativeDate)\n\(session.id)"
+        item.isEnabled = true
+        item.submenu = sessionActionsMenu(for: session, isActive: isActive)
+    }
+
+    private func sessionActionsMenu(for session: CodexSession, isActive: Bool) -> NSMenu {
+        let actions = NSMenu(title: session.displayName)
+        actions.autoenablesItems = false
+
+        actions.addItem(sessionActionItem(
+            title: "Open in ChatGPT",
+            symbol: "bubble.left.and.bubble.right",
+            action: #selector(openSessionInChatGPT(_:)),
+            session: session
+        ))
+
+        if !isActive {
+            actions.addItem(sessionActionItem(
+                title: "Resume in Terminal",
+                symbol: "play.fill",
+                action: #selector(resumeSession(_:)),
+                session: session
+            ))
+        }
+
+        actions.addItem(sessionActionItem(
+            title: "Fork in New Terminal",
+            symbol: "arrow.triangle.branch",
+            action: #selector(forkSession(_:)),
+            session: session
+        ))
+        actions.addItem(sessionActionItem(
+            title: "Reveal Working Directory",
+            symbol: "folder",
+            action: #selector(revealWorkingDirectory(_:)),
+            session: session
+        ))
+
+        let copyItem = NSMenuItem(title: "Copy", action: nil, keyEquivalent: "")
+        copyItem.isEnabled = true
+        copyItem.image = menuSymbol("doc.on.doc")
+        copyItem.submenu = copyMenu(for: session)
+        actions.addItem(copyItem)
+        actions.addItem(.separator())
+
+        let profileTitle: String
+        if let profile = profileStore.profile(for: session.id) {
+            profileTitle = "Profile: \(profile.displayName)…"
+        } else {
+            profileTitle = "Set Session Profile…"
+        }
+        actions.addItem(sessionActionItem(
+            title: profileTitle,
+            symbol: "person.crop.circle.badge.checkmark",
+            action: #selector(chooseSessionProfile(_:)),
+            session: session
+        ))
+
+        if !isActive {
+            actions.addItem(.separator())
+            actions.addItem(sessionActionItem(
+                title: "Archive Session…",
+                symbol: "archivebox",
+                action: #selector(archiveSession(_:)),
+                session: session
+            ))
+        }
+        return actions
+    }
+
+    private func sessionActionItem(
+        title: String,
+        symbol: String,
+        action: Selector,
+        session: CodexSession
+    ) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+        item.target = self
+        item.representedObject = session
+        item.image = menuSymbol(symbol)
+        item.isEnabled = true
+        return item
+    }
+
+    private func copyMenu(for session: CodexSession) -> NSMenu {
+        let menu = NSMenu(title: "Copy")
+        menu.autoenablesItems = false
+        let values = [
+            ("Name", session.displayName),
+            ("Session ID", session.id),
+            ("Working Directory", session.cwd),
+            ("ChatGPT Link", "codex://threads/\(session.id)")
+        ]
+        for (title, value) in values {
+            let item = NSMenuItem(title: title, action: #selector(copySessionValue(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = value
+            item.isEnabled = true
+            menu.addItem(item)
+        }
+        return menu
     }
 
     private func updateAwakePresentation() {

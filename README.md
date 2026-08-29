@@ -9,7 +9,7 @@ A small native macOS menu-bar companion for Codex CLI. It keeps long-running CLI
 
 - Starts at login and reconnects CLI Remote Control after wake or transient network loss.
 - Prevents idle system sleep always, never, or only while an interactive Codex CLI session is active.
-- Shows named active sessions immediately and keeps recent sessions in a nested menu.
+- Shows named active sessions immediately, keeps recent sessions in a nested menu, and provides safe per-session actions.
 - Uses no analytics, privileged helper, root component, or direct network client.
 
 ## Quick start
@@ -31,6 +31,30 @@ The menu is arranged in three sections:
 3. **Awake** — the current power assertion and the three sleep-prevention modes.
 
 The forced-white menu-bar icon is an original terminal-and-network mark. Its terminal body fills while Codex Awake owns a power assertion, and its network nodes fill while CLI Remote Control is connected.
+
+## Session actions
+
+Each active or recent session opens a native submenu instead of launching a command immediately:
+
+- **Open in ChatGPT** opens the exact `codex://threads/<session-id>` deep link.
+- **Resume in Terminal** is available only for recent sessions, so an already-active session is never resumed twice.
+- **Fork in New Terminal** creates an independent continuation of an active or recent session.
+- **Reveal Working Directory** opens the session directory in Finder.
+- **Copy** exposes the session name, ID, working directory, and ChatGPT deep link.
+- **Archive Session** is available only for recent sessions and always requires confirmation. Delete and Stop actions are intentionally not exposed.
+
+Resume and Fork open the built-in Terminal app. macOS may ask once for permission to let Codex Awake control Terminal.
+
+### Per-session profiles
+
+Resume and Fork preserve the selected session's CLI profile by rebuilding the command with the same `--profile <name>` before the subcommand. Codex thread metadata does not contain the profile name, so Codex Awake keeps a local session-ID-to-profile mapping in `UserDefaults`:
+
+- While a CLI session is active, the app captures an explicit `--profile` or `-p` from its process command and remembers it.
+- If an older recent session has no known mapping, the first Resume or Fork asks for its original profile and remembers the answer.
+- **Default (no --profile)** is an explicit saved choice, never a silent fallback.
+- **Profile: ...** in a session submenu lets you inspect or correct the saved choice.
+
+The mapping changes only how Codex Awake launches future Resume and Fork commands. It does not rewrite the Codex thread or its transcript.
 
 ## Awake modes
 
@@ -104,11 +128,12 @@ Use `./scripts/uninstall.sh --purge` to remove the saved mode as well.
 - Closing the MacBook lid still follows macOS clamshell rules.
 - Active user sessions are identified from rollout files currently held open by the managed app-server. Service and sub-agent rollouts are excluded.
 - Session names and working directories come from the local Codex state database and remain on the Mac.
+- Per-session profile selections are stored locally in the Codex Awake `UserDefaults` domain and are not written into Codex thread metadata.
 - The installer removes the obsolete standalone `com.stslex.codex-remote-control` LaunchAgent so Codex Awake is the single login-start owner.
 
 ## Privacy and security
 
-Codex Awake has no analytics, privileged helper, or root component. It reads the local process list and Codex state database, calls the public IOKit power-management API, and invokes the locally installed Codex CLI for Remote Control status and actions. Network traffic and authentication remain owned by Codex CLI.
+Codex Awake has no analytics, privileged helper, or root component. It reads the local process list and Codex state database, calls the public IOKit power-management API, and invokes the locally installed Codex CLI for Remote Control and explicit session actions. Network traffic and authentication remain owned by Codex CLI.
 
 ## Contributing
 

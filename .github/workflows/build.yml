@@ -14,6 +14,9 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v7
 
+      - name: Test Swift package
+        run: swift test
+
       - name: Build Swift package
         run: swift build -c release
 

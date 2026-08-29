@@ -46,7 +46,7 @@ private struct RemoteStartResponse: Decodable {
     let timedOut: Bool?
 }
 
-private struct CommandResult {
+struct CommandResult {
     let terminationStatus: Int32
     let standardOutput: String
     let standardError: String
@@ -58,7 +58,7 @@ private struct CommandResult {
     }
 }
 
-private enum CommandRunner {
+enum CommandRunner {
     static func run(executable: URL, arguments: [String]) -> CommandResult {
         let process = Process()
         process.executableURL = executable
@@ -106,6 +106,10 @@ enum CodexRemoteBridge {
             URL(fileURLWithPath: "/Applications/ChatGPT.app/Contents/Resources/codex")
         ]
         return candidates.first { fileManager.isExecutableFile(atPath: $0.path) }
+    }
+
+    static var codexExecutableURL: URL? {
+        codexBinary
     }
 
     private static var stateDatabaseURL: URL {
@@ -212,6 +216,7 @@ enum CodexRemoteBridge {
         FROM threads
         WHERE id IN (\(quotedIDs))
           AND archived = 0
+          AND source = 'cli'
           AND COALESCE(thread_source, 'user') = 'user'
           AND trim(COALESCE(agent_role, '')) = ''
         ORDER BY recency_at DESC, id DESC
@@ -228,6 +233,44 @@ enum CodexRemoteBridge {
             return []
         }
         return sessions
+    }
+
+    static func discoveredProfiles(for sessions: [CodexSession]) -> [String: SessionProfile] {
+        CodexProcessInspector.resolvedProfiles(
+            activeSessionIDs: sessions.map(\.id),
+            processes: CodexProcessInspector.liveProcesses()
+        )
+    }
+
+    static func availableProfiles() -> [String] {
+        let codexDirectory = fileManager.homeDirectoryForCurrentUser
+            .appendingPathComponent(".codex", isDirectory: true)
+        guard let entries = try? fileManager.contentsOfDirectory(
+            at: codexDirectory,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else {
+            return []
+        }
+
+        let suffix = ".config.toml"
+        return entries.compactMap { url -> String? in
+            let filename = url.lastPathComponent
+            guard filename.hasSuffix(suffix) else { return nil }
+            let profile = String(filename.dropLast(suffix.count))
+            return profile.isEmpty ? nil : profile
+        }
+        .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
+
+    static func archiveSession(id: String) -> String? {
+        guard let codexBinary else { return "Codex CLI was not found" }
+        let result = CommandRunner.run(
+            executable: codexBinary,
+            arguments: ["--remote", "unix://", "archive", id]
+        )
+        guard result.terminationStatus != 0 else { return nil }
+        return friendlyRemoteError(result.combinedOutput)
     }
 
     private static func activeThreadIDs() -> [String] {
