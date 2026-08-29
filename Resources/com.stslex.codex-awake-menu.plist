@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.stslex.codex-awake-menu</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__CODEX_AWAKE_EXECUTABLE__</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>StandardOutPath</key>
+    <string>__CODEX_AWAKE_STDOUT__</string>
+    <key>StandardErrorPath</key>
+    <string>__CODEX_AWAKE_STDERR__</string>
+</dict>
+</plist>

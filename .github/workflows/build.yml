@@ -1,0 +1,24 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build Swift package
+        run: swift build -c release
+
+      - name: Build app bundle
+        run: ./scripts/build.sh
+
+      - name: Verify app signature
+        run: codesign --verify --deep --strict --verbose=2 "build/Codex Awake.app"
