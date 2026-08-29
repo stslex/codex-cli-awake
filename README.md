@@ -1,10 +1,18 @@
 # Codex CLI Awake
 
-A small native macOS menu-bar app that prevents idle system sleep while Codex CLI sessions are open.
+A native macOS menu-bar companion for Codex CLI. It keeps active CLI work awake, shows the CLI Remote Control connection, lists recent named sessions, and provides safe Remote and sleep controls in one menu.
 
-Codex Awake uses a native IOKit power assertion. It does not prevent display sleep, modify global Energy Saver settings, or establish a Codex Remote connection.
+## Menu
 
-## Modes
+The menu is arranged in three sections:
+
+1. **Remote Control** — live connection state plus a manual start/reconnect action.
+2. **Active Sessions** — loaded user sessions are shown immediately; recent CLI sessions stay out of the way in a nested **Recent Sessions** menu.
+3. **Awake** — the current power assertion and the three sleep-prevention modes.
+
+The forced-white menu-bar icon is an original terminal-and-network mark. Its terminal body fills while Codex Awake owns a power assertion, and its network nodes fill while CLI Remote Control is connected.
+
+## Awake modes
 
 | Mode | Behavior |
 | --- | --- |
@@ -12,14 +20,25 @@ Codex Awake uses a native IOKit power assertion. It does not prevent display sle
 | **Off** | Releases the assertion owned by Codex Awake. |
 | **On active session** | Holds the assertion while an interactive Codex CLI/TUI process is present. |
 
-The selected mode is stored in `UserDefaults` and restored after login. The menu-bar icon is a forced-white cup: filled while the assertion is active and outlined while it is inactive.
+The selected mode is stored in `UserDefaults` and restored after login. `On active session` checks the local process list every three seconds. It detects interactive `codex` processes with a TTY, including `codex --remote unix://`, and ignores app servers, Remote Control helpers, MCP servers, code-mode hosts, and non-interactive commands.
 
-`On active session` checks the local process list every three seconds. It detects interactive `codex` processes with a TTY, including `codex --remote unix://`, and ignores background app servers, Remote Control watchdogs, MCP servers, code-mode hosts, and non-interactive commands.
+Codex Awake uses a native IOKit power assertion. It does not prevent display sleep or modify global Energy Saver settings.
+
+## CLI Remote Control
+
+Codex Awake is the login-start owner for CLI Remote Control. Its LaunchAgent starts the app when the user logs in; the app then runs the idempotent `codex remote-control start --json` command and refreshes the connection every ten seconds. This also reconnects the managed CLI host after wake or a transient network interruption.
+
+The menu exposes a manual **Start / Reconnect Remote Control** action. Remote shutdown is intentionally not exposed because the current managed daemon shutdown path also disconnects attached CLI/TUI sessions.
+
+Only one app can own the Remote host connection. If ChatGPT Desktop has **Control this Mac** enabled, close it or disable that setting before enabling the CLI Remote host. Codex Awake reports this ownership conflict as a connection error.
+
+See the official [Remote connections documentation](https://learn.chatgpt.com/docs/remote-connections) for account, workspace, network, sleep, and mobile requirements.
 
 ## Requirements
 
 - macOS 13 or later
-- Xcode Command Line Tools or Xcode with Swift 5.9 or later
+- A Codex CLI version that provides `remote-control` and managed `app-server daemon` commands
+- Xcode Command Line Tools or Xcode with Swift 5.9 or later to build from source
 
 ## Install
 
@@ -29,7 +48,7 @@ cd codex-cli-awake
 ./scripts/install.sh
 ```
 
-The installer builds an ad-hoc signed app, copies it to `~/Applications/Codex Awake.app`, installs a user LaunchAgent, and starts the app immediately. The default mode for a new installation is **On active session**.
+The installer builds an ad-hoc signed app, copies it to `~/Applications/Codex Awake.app`, installs a user LaunchAgent, removes the obsolete standalone Remote watchdog LaunchAgent if present, and starts the app immediately. The default mode for a new installation is **On active session**.
 
 ## Build without installing
 
@@ -39,11 +58,17 @@ The installer builds an ad-hoc signed app, copies it to `~/Applications/Codex Aw
 
 The app bundle is written to `build/Codex Awake.app`.
 
-To run the process detector from a terminal:
+Command-line diagnostics are available from the built executable:
 
 ```bash
 ./build/Codex\ Awake.app/Contents/MacOS/CodexAwake --detect-sessions
+./build/Codex\ Awake.app/Contents/MacOS/CodexAwake --remote-status
+./build/Codex\ Awake.app/Contents/MacOS/CodexAwake --list-active-sessions
+./build/Codex\ Awake.app/Contents/MacOS/CodexAwake --list-sessions
+./build/Codex\ Awake.app/Contents/MacOS/CodexAwake --remote-start
 ```
+
+`--detect-sessions`, `--list-active-sessions`, and `--list-sessions` are read-only. `--remote-status` and `--remote-start` both ensure that CLI Remote Control is started before returning its status.
 
 ## Verify the installation
 
@@ -67,11 +92,12 @@ Use `./scripts/uninstall.sh --purge` to remove the saved mode as well.
 - **Off** releases only the assertion created by Codex Awake. Other applications can independently prevent sleep.
 - ChatGPT's **Keep this Mac awake** setting is separate from this app.
 - Closing the MacBook lid still follows macOS clamshell rules.
-- Codex Remote availability also depends on the host app, network, account, workspace, and Remote connection state. See the official [Remote connections documentation](https://learn.chatgpt.com/docs/remote-connections).
+- Active user sessions are identified from rollout files currently held open by the managed app-server. Service and sub-agent rollouts are excluded.
+- Session names and working directories come from the local Codex state database and remain on the Mac.
 
 ## Privacy and security
 
-Codex Awake runs entirely on the Mac. It reads the local process list to identify interactive Codex CLI sessions and calls the public IOKit power-management API. It has no analytics, network access, privileged helper, or root component.
+Codex Awake has no analytics, privileged helper, or root component. It reads the local process list and Codex state database, calls the public IOKit power-management API, and invokes the locally installed Codex CLI for Remote Control status and actions. Network traffic and authentication remain owned by Codex CLI.
 
 ## Contributing
 
