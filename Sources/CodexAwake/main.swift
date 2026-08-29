@@ -99,16 +99,19 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private let recentSessionsItem = NSMenuItem(title: "Recent Sessions", action: nil, keyEquivalent: "")
     private let recentSessionsMenu = NSMenu(title: "Recent Sessions")
     private let awakeStatusItem = NSMenuItem(title: "Checking Codex sessions…", action: nil, keyEquivalent: "")
+    private let launchAtLoginItem = NSMenuItem(title: "Launch at Login", action: nil, keyEquivalent: "")
     private let assertion = SleepAssertion()
     private let detectorQueue = DispatchQueue(label: "com.stslex.CodexAwake.session-detector", qos: .utility)
     private let remoteQueue = DispatchQueue(label: "com.stslex.CodexAwake.remote", qos: .utility)
     private let relativeDateFormatter = RelativeDateTimeFormatter()
     private let profileStore = SessionProfileStore()
+    private let loginItemManager = LoginItemManager()
 
     private var modeItems: [AwakeMode: NSMenuItem] = [:]
     private var activeSessionItems: [NSMenuItem] = []
     private var currentMode: AwakeMode = .activeSession
     private var remoteStatus = RemoteStatus.checking
+    private var loginItemStatus = LoginItemStatus(state: .notRegistered, desired: true, detail: nil)
     private var activeSessions: [CodexSession] = []
     private var recentSessions: [CodexSession] = []
     private var activeSessionCount = 0
@@ -124,6 +127,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         relativeDateFormatter.unitsStyle = .abbreviated
         configureMenu()
         loadMode()
+        loginItemStatus = loginItemManager.reconcile()
         applyMode()
         scanForSessions()
         refreshRemoteAndSessions(force: true)
@@ -148,8 +152,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     func menuWillOpen(_ menu: NSMenu) {
+        loginItemStatus = loginItemManager.status()
         scanForSessions()
         refreshRemoteAndSessions(force: false)
+        updatePresentation()
     }
 
     private func configureMenu() {
@@ -197,6 +203,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
 
         menu.addItem(.separator())
+        menu.addItem(sectionHeader("APP"))
+        launchAtLoginItem.target = self
+        launchAtLoginItem.action = #selector(toggleLaunchAtLogin)
+        launchAtLoginItem.isEnabled = true
+        menu.addItem(launchAtLoginItem)
+
         let refreshItem = NSMenuItem(title: "Refresh", action: #selector(refreshNow), keyEquivalent: "r")
         refreshItem.target = self
         refreshItem.isEnabled = true
@@ -269,8 +281,29 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     @objc private func refreshNow() {
+        loginItemStatus = loginItemManager.status()
         scanForSessions()
         refreshRemoteAndSessions(force: true)
+        updatePresentation()
+    }
+
+    @objc private func toggleLaunchAtLogin() {
+        let presentation = LoginItemMenuPresentation.make(status: loginItemStatus)
+        switch presentation.action {
+        case .register:
+            loginItemStatus = loginItemManager.register()
+        case .unregister:
+            loginItemStatus = loginItemManager.unregister()
+        case .openSettings:
+            LoginItemManager.openSystemSettings()
+            return
+        }
+
+        updatePresentation()
+        if let detail = loginItemStatus.detail,
+           loginItemStatus.state != .requiresApproval {
+            showError("Launch at Login could not be updated:\n\(detail)")
+        }
     }
 
     @objc private func openSessionInChatGPT(_ sender: NSMenuItem) {
@@ -501,6 +534,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         updateRemotePresentation()
         updateSessionPresentation()
         updateAwakePresentation()
+        updateLoginItemPresentation()
 
         guard let button = statusItem.button else { return }
         button.image = StatusIconFactory.make(
@@ -729,6 +763,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
     }
 
+    private func updateLoginItemPresentation() {
+        let presentation = LoginItemMenuPresentation.make(status: loginItemStatus)
+        launchAtLoginItem.title = presentation.title
+        launchAtLoginItem.image = menuSymbol(presentation.symbolName)
+        launchAtLoginItem.state = presentation.isChecked ? .on : .off
+        launchAtLoginItem.toolTip = loginItemStatus.detail
+    }
+
     private func compact(_ value: String, maximumLength: Int) -> String {
         guard value.count > maximumLength else { return value }
         return String(value.prefix(maximumLength - 1)) + "…"
@@ -768,6 +810,26 @@ if arguments.contains("--remote-start") {
     let status = CodexRemoteBridge.ensureRemoteStarted()
     printJSON(status)
     exit(status.state == .connected ? EXIT_SUCCESS : EXIT_FAILURE)
+}
+if arguments.contains("--login-item-status") {
+    let status = LoginItemManager().status()
+    printJSON(status)
+    exit(LoginItemCommandExitCode.registration(status))
+}
+if arguments.contains("--register-login-item") {
+    let status = LoginItemManager().register()
+    printJSON(status)
+    exit(LoginItemCommandExitCode.registration(status))
+}
+if arguments.contains("--reconcile-login-item") {
+    let status = LoginItemManager().reconcile()
+    printJSON(status)
+    exit(LoginItemCommandExitCode.reconciliation(status))
+}
+if arguments.contains("--unregister-login-item") {
+    let status = LoginItemManager().unregister()
+    printJSON(status)
+    exit(LoginItemCommandExitCode.unregistration(status))
 }
 
 MainActor.assumeIsolated {

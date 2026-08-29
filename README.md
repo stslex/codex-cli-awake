@@ -7,7 +7,7 @@
 
 A small native macOS menu-bar companion for Codex CLI. It keeps long-running CLI work awake, owns the local CLI Remote Control connection, and makes active and recent sessions visible without opening another full application.
 
-- Starts at login and reconnects CLI Remote Control after wake or transient network loss.
+- Registers itself as a native macOS Login Item and reconnects CLI Remote Control after wake or transient network loss.
 - Prevents idle system sleep always, never, or only while an interactive Codex CLI session is active.
 - Shows named active sessions immediately, keeps recent sessions in a nested menu, and provides safe per-session actions.
 - Uses no analytics, privileged helper, root component, or direct network client.
@@ -20,15 +20,29 @@ cd codex-cli-awake
 ./scripts/install.sh
 ```
 
-The installer builds an ad-hoc signed app, copies it to `~/Applications/Codex Awake.app`, registers its per-user LaunchAgent, and starts it immediately. The default Awake mode for a new installation is **On active session**.
+The installer builds an ad-hoc signed app, copies it to `~/Applications/Codex Awake.app`, registers it with macOS Service Management, and starts it immediately. The default Awake mode for a new installation is **On active session**. If Service Management is unavailable for a source build, the installer keeps a compatibility LaunchAgent as a fail-safe and reports that choice.
+
+### Distribution status
+
+Source installation is the supported path until the first Developer ID-signed and Apple-notarized GitHub release is published. The repository already contains the universal release pipeline and Homebrew Cask generator, but it intentionally does not publish an ad-hoc signed binary.
+
+After the first signed release and public tap are available, the intended Homebrew flow is:
+
+```bash
+brew tap stslex/tap
+brew install --cask codex-cli-awake
+```
+
+Do not treat that command as available until the tap is linked from this README or the GitHub Releases page contains a notarized asset.
 
 ## Menu
 
-The menu is arranged in three sections:
+The menu is arranged in four sections:
 
 1. **Remote Control** — live connection state plus a manual start/reconnect action.
 2. **Active Sessions** — loaded user sessions are shown immediately; recent CLI sessions stay out of the way in a nested **Recent Sessions** menu.
 3. **Awake** — the current power assertion and the three sleep-prevention modes.
+4. **App** — native Launch at Login state, manual refresh, and quit.
 
 The forced-white menu-bar icon is an original terminal-and-network mark. Its terminal body fills while Codex Awake owns a power assertion, and its network nodes fill while CLI Remote Control is connected.
 
@@ -70,7 +84,9 @@ Codex Awake uses a native IOKit power assertion. It does not prevent display sle
 
 ## CLI Remote Control
 
-Codex Awake is the login-start owner for CLI Remote Control. Its LaunchAgent starts the app when the user logs in; the app then runs the idempotent `codex remote-control start --json` command and refreshes the connection every ten seconds. This also reconnects the managed CLI host after wake or a transient network interruption.
+Codex Awake is the login-start owner for CLI Remote Control. macOS starts the main app through `SMAppService.mainApp`; the app then runs the idempotent `codex remote-control start --json` command and refreshes the connection every ten seconds. This also reconnects the managed CLI host after wake or a transient network interruption.
+
+The **Launch at Login** menu item exposes the actual Service Management state. If macOS requires approval, it opens **System Settings > General > Login Items**. Turning the item off unregisters only Codex Awake; it does not stop Remote Control or any attached CLI/TUI session.
 
 The menu exposes a manual **Start / Reconnect Remote Control** action. Remote shutdown is intentionally not exposed because the current managed daemon shutdown path also disconnects attached CLI/TUI sessions.
 
@@ -88,9 +104,10 @@ See the official [Remote connections documentation](https://learn.chatgpt.com/do
 
 ```bash
 ./scripts/build.sh
+./scripts/build.sh release --universal
 ```
 
-The app bundle is written to `build/Codex Awake.app`.
+The app bundle is written to `build/Codex Awake.app`. The first command builds for the current Mac; `--universal` builds one `arm64` and `x86_64` bundle.
 
 Command-line diagnostics are available from the built executable:
 
@@ -100,6 +117,9 @@ Command-line diagnostics are available from the built executable:
 ./build/Codex\ Awake.app/Contents/MacOS/CodexAwake --list-active-sessions
 ./build/Codex\ Awake.app/Contents/MacOS/CodexAwake --list-sessions
 ./build/Codex\ Awake.app/Contents/MacOS/CodexAwake --remote-start
+./build/Codex\ Awake.app/Contents/MacOS/CodexAwake --login-item-status
+./build/Codex\ Awake.app/Contents/MacOS/CodexAwake --register-login-item
+./build/Codex\ Awake.app/Contents/MacOS/CodexAwake --unregister-login-item
 ```
 
 `--detect-sessions`, `--list-active-sessions`, and `--list-sessions` are read-only. `--remote-status` and `--remote-start` both ensure that CLI Remote Control is started before returning its status.
@@ -107,11 +127,11 @@ Command-line diagnostics are available from the built executable:
 ## Verify the installation
 
 ```bash
-launchctl print "gui/$(id -u)/com.stslex.codex-awake-menu"
+~/Applications/Codex\ Awake.app/Contents/MacOS/CodexAwake --login-item-status
 pmset -g assertions
 ```
 
-When Codex Awake is holding the assertion, `pmset` lists a `CodexAwake` process with the assertion name `Codex Awake menu-bar mode`.
+The Login Item command reports `enabled` when native login start is active. When Codex Awake is holding the assertion, `pmset` lists a `CodexAwake` process with the assertion name `Codex Awake menu-bar mode`.
 
 ## Uninstall
 
@@ -130,6 +150,12 @@ Use `./scripts/uninstall.sh --purge` to remove the saved mode as well.
 - Session names and working directories come from the local Codex state database and remain on the Mac.
 - Per-session profile selections are stored locally in the Codex Awake `UserDefaults` domain and are not written into Codex thread metadata.
 - The installer removes the obsolete standalone `com.stslex.codex-remote-control` LaunchAgent so Codex Awake is the single login-start owner.
+
+## Releases and updates
+
+Tagged releases are built once in GitHub Actions as a universal app, signed with Developer ID, notarized and stapled by Apple, checked by Gatekeeper, checksummed, and attested before a GitHub Release can be created. Missing credentials or any failed verification stops publication.
+
+Homebrew is the selected update channel for packaged releases. A built-in updater is intentionally deferred so the app does not ship a second framework, signing surface, and update policy before the signed release pipeline exists. See [RELEASING.md](RELEASING.md) and [ADR-0001](docs/adr/0001-signed-releases-and-homebrew.md).
 
 ## Privacy and security
 

@@ -15,7 +15,8 @@ let package = Package(
             name: "CodexAwake",
             linkerSettings: [
                 .linkedFramework("AppKit"),
-                .linkedFramework("IOKit")
+                .linkedFramework("IOKit"),
+                .linkedFramework("ServiceManagement")
             ]
         ),
         .testTarget(

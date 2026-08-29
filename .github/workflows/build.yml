@@ -20,8 +20,13 @@ jobs:
       - name: Build Swift package
         run: swift build -c release
 
-      - name: Build app bundle
-        run: ./scripts/build.sh
+      - name: Build universal app bundle
+        run: ./scripts/build.sh release --universal
 
-      - name: Verify app signature
-        run: codesign --verify --deep --strict --verbose=2 "build/Codex Awake.app"
+      - name: Verify universal app bundle
+        run: |
+          binary="build/Codex Awake.app/Contents/MacOS/CodexAwake"
+          architectures="$(lipo -archs "${binary}")"
+          [[ " ${architectures} " == *" arm64 "* ]]
+          [[ " ${architectures} " == *" x86_64 "* ]]
+          codesign --verify --deep --strict --verbose=2 "build/Codex Awake.app"

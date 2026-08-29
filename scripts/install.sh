@@ -14,6 +14,51 @@ launch_agents_dir="${HOME}/Library/LaunchAgents"
 launch_agent="${launch_agents_dir}/${label}.plist"
 legacy_remote_launch_agent="${launch_agents_dir}/${legacy_remote_label}.plist"
 log_dir="${HOME}/.codex/log"
+installed_executable="${installed_app}/Contents/MacOS/CodexAwake"
+
+supports_login_item_cli() {
+    local executable="$1"
+    [[ -x "${executable}" ]] && /usr/bin/strings "${executable}" | /usr/bin/grep -q -- "--unregister-login-item"
+}
+
+stop_running_app() {
+    local stale_pids
+    stale_pids="$(pgrep -x CodexAwake || true)"
+    if [[ -z "${stale_pids}" ]]; then
+        return
+    fi
+
+    while IFS= read -r stale_pid; do
+        [[ -n "${stale_pid}" ]] && kill -TERM "${stale_pid}"
+    done <<< "${stale_pids}"
+
+    for _ in {1..20}; do
+        pgrep -x CodexAwake >/dev/null 2>&1 || return
+        sleep 0.1
+    done
+
+    echo "An existing CodexAwake process did not terminate." >&2
+    exit 1
+}
+
+install_legacy_fallback() {
+    local temporary_plist
+    temporary_plist="$(mktemp "${TMPDIR:-/tmp}/codex-awake-launch-agent.XXXXXX")"
+    install -m 0644 "${project_dir}/Resources/${label}.plist" "${temporary_plist}"
+    plutil -replace ProgramArguments \
+        -json "[\"${installed_executable}\"]" \
+        "${temporary_plist}"
+    plutil -replace StandardOutPath \
+        -string "${log_dir}/codex-awake-menu.out.log" \
+        "${temporary_plist}"
+    plutil -replace StandardErrorPath \
+        -string "${log_dir}/codex-awake-menu.err.log" \
+        "${temporary_plist}"
+    plutil -lint "${temporary_plist}"
+    install -m 0644 "${temporary_plist}" "${launch_agent}"
+    rm -f -- "${temporary_plist}"
+    launchctl bootstrap "${launch_domain}" "${launch_agent}"
+}
 
 "${script_dir}/build.sh" release
 
@@ -28,45 +73,40 @@ if launchctl print "${launch_domain}/${legacy_remote_label}" >/dev/null 2>&1; th
 fi
 rm -f -- "${legacy_remote_launch_agent}"
 
-stale_pids="$(pgrep -x CodexAwake || true)"
-if [[ -n "${stale_pids}" ]]; then
-    while IFS= read -r stale_pid; do
-        [[ -n "${stale_pid}" ]] && kill -TERM "${stale_pid}"
-    done <<< "${stale_pids}"
-
-    for _ in {1..20}; do
-        pgrep -x CodexAwake >/dev/null 2>&1 || break
-        sleep 0.1
-    done
-
-    if pgrep -x CodexAwake >/dev/null 2>&1; then
-        echo "An existing CodexAwake process did not terminate." >&2
-        exit 1
-    fi
+if supports_login_item_cli "${installed_executable}"; then
+    "${installed_executable}" --unregister-login-item >/dev/null 2>&1 || true
 fi
+stop_running_app
 
 ditto "${project_dir}/build/Codex Awake.app" "${installed_app}"
-
-temporary_plist="$(mktemp "${TMPDIR:-/tmp}/codex-awake-launch-agent.XXXXXX")"
-install -m 0644 "${project_dir}/Resources/${label}.plist" "${temporary_plist}"
-plutil -replace ProgramArguments \
-    -json "[\"${installed_app}/Contents/MacOS/CodexAwake\"]" \
-    "${temporary_plist}"
-plutil -replace StandardOutPath \
-    -string "${log_dir}/codex-awake-menu.out.log" \
-    "${temporary_plist}"
-plutil -replace StandardErrorPath \
-    -string "${log_dir}/codex-awake-menu.err.log" \
-    "${temporary_plist}"
-plutil -lint "${temporary_plist}"
-install -m 0644 "${temporary_plist}" "${launch_agent}"
-rm -f -- "${temporary_plist}"
 
 if ! defaults read "${bundle_id}" awakeMode >/dev/null 2>&1; then
     defaults write "${bundle_id}" awakeMode -string active-session
 fi
 
-launchctl bootstrap "${launch_domain}" "${launch_agent}"
+registration_output="$(mktemp "${TMPDIR:-/tmp}/codex-awake-registration.XXXXXX")"
+registration_exit=0
+"${installed_executable}" --register-login-item >"${registration_output}" 2>&1 || registration_exit=$?
+
+case "${registration_exit}" in
+    0)
+        rm -f -- "${launch_agent}"
+        /usr/bin/open -g "${installed_app}"
+        login_message="Launch at Login is enabled through macOS Service Management."
+        ;;
+    2)
+        rm -f -- "${launch_agent}"
+        /usr/bin/open -g "${installed_app}"
+        login_message="Launch at Login needs approval in System Settings > General > Login Items."
+        ;;
+    *)
+        echo "SMAppService registration failed; using the legacy per-user LaunchAgent fallback." >&2
+        sed -n '1,20p' "${registration_output}" >&2
+        install_legacy_fallback
+        login_message="Launch at Login is enabled through the compatibility LaunchAgent."
+        ;;
+esac
+rm -f -- "${registration_output}"
 
 echo "Installed ${installed_app}"
-echo "Codex Awake is now running and will start automatically at login."
+echo "${login_message}"

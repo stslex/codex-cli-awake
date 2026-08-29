@@ -1,0 +1,33 @@
+cask "codex-cli-awake" do
+  version "{{VERSION}}"
+  sha256 "{{SHA256}}"
+
+  url "https://github.com/stslex/codex-cli-awake/releases/download/v#{version}/Codex-Awake-#{version}-universal.zip"
+  name "Codex Awake"
+  desc "Menu bar companion for Codex CLI Remote Control and sleep prevention"
+  homepage "https://github.com/stslex/codex-cli-awake"
+
+  livecheck do
+    url :url
+    strategy :github_latest
+  end
+
+  depends_on macos: :ventura
+
+  app "Codex Awake.app"
+
+  postflight_steps do
+    run "/usr/bin/open",
+        args: ["-g", "{{appdir}}/Codex Awake.app"]
+  end
+
+  uninstall quit:       "com.stslex.CodexAwake",
+            login_item: "Codex Awake"
+
+  zap trash: [
+    "~/.codex/log/codex-awake-menu.err.log",
+    "~/.codex/log/codex-awake-menu.out.log",
+    "~/Library/LaunchAgents/com.stslex.codex-awake-menu.plist",
+    "~/Library/Preferences/com.stslex.CodexAwake.plist",
+  ]
+end
