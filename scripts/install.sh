@@ -21,6 +21,23 @@ if launchctl print "${launch_domain}/${label}" >/dev/null 2>&1; then
     launchctl bootout "${launch_domain}/${label}"
 fi
 
+stale_pids="$(pgrep -x CodexAwake || true)"
+if [[ -n "${stale_pids}" ]]; then
+    while IFS= read -r stale_pid; do
+        [[ -n "${stale_pid}" ]] && kill -TERM "${stale_pid}"
+    done <<< "${stale_pids}"
+
+    for _ in {1..20}; do
+        pgrep -x CodexAwake >/dev/null 2>&1 || break
+        sleep 0.1
+    done
+
+    if pgrep -x CodexAwake >/dev/null 2>&1; then
+        echo "An existing CodexAwake process did not terminate." >&2
+        exit 1
+    fi
+fi
+
 ditto "${project_dir}/build/Codex Awake.app" "${installed_app}"
 
 temporary_plist="$(mktemp "${TMPDIR:-/tmp}/codex-awake-launch-agent.XXXXXX")"
