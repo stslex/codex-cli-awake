@@ -40,6 +40,12 @@ final_archive="${dist_dir}/${final_archive_name}"
 checksum_file="${final_archive}.sha256"
 cask_file="${dist_dir}/codex-cli-awake.rb"
 
+updater_archive_name="$("${bundle}/Contents/MacOS/CodexAwake" --update-archive-name)"
+if [[ "${updater_archive_name}" != "${final_archive_name}" ]]; then
+    echo "Updater expects ${updater_archive_name}, but packaging would publish ${final_archive_name}." >&2
+    exit 1
+fi
+
 rm -f -- "${final_archive}" "${checksum_file}" "${cask_file}"
 ditto -c -k --keepParent --sequesterRsrc "${bundle}" "${submission_archive}"
 

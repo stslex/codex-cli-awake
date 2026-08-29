@@ -1,6 +1,6 @@
 # Releasing Codex Awake
 
-Codex Awake publishes only universal, Developer ID-signed, Apple-notarized artifacts. The release workflow fails closed: an unsigned, unnotarized, unstapled, or Gatekeeper-rejected app never reaches GitHub Releases.
+Codex Awake publishes only universal, Developer ID-signed, Apple-notarized artifacts. The release workflow fails closed: an unsigned, unnotarized, unstapled, or Gatekeeper-rejected app never reaches GitHub Releases. The built-in updater and Homebrew Cask consume the same immutable archive and SHA-256 checksum.
 
 ## One-time repository setup
 
@@ -28,13 +28,28 @@ Run the **Release** workflow manually with `workflow_dispatch`. It runs tests an
 3. Create and push a signed tag that exactly matches the marketing version:
 
    ```bash
-   git tag -s v1.3.0 -m "release: v1.3.0"
-   git push origin v1.3.0
+   git tag -s v1.4.0 -m "release: v1.4.0"
+   git push origin v1.4.0
    ```
 
 4. The tag workflow verifies the version, runs tests, imports the ephemeral certificate, builds one `arm64` + `x86_64` app, signs with hardened runtime, submits it to Apple, staples the ticket, runs `codesign` and `spctl`, creates a SHA-256 checksum and Homebrew Cask, records build provenance, and finally creates the GitHub Release.
 
 The workflow stops before publication when a setting is absent or any verification fails. Do not bypass a failed signing, notarization, Gatekeeper, checksum, or attestation step.
+
+## Built-in updater contract
+
+The application reads `https://api.github.com/repos/stslex/codex-cli-awake/releases/latest` without authentication. A stable release is eligible only when all of the following match exactly:
+
+- tag: `v<CFBundleShortVersionString>` using three-component semantic versioning;
+- archive: `Codex-Awake-<version>-universal.zip`;
+- checksum: `Codex-Awake-<version>-universal.zip.sha256`;
+- release and asset URLs: HTTPS URLs owned by this repository.
+
+Do not rename those assets without changing and testing `AppUpdateClient` in the same release. `package-release.sh` asks the built application for `--update-archive-name` and fails before notarization when the application and packaging contract differ. The updater verifies the checksum before extraction, then requires the extracted app to have bundle identifier `com.stslex.CodexAwake`, the advertised version, a valid code signature, and a successful Gatekeeper assessment. It revalidates the staged bundle in the replacement helper.
+
+The updater never installs automatically. It checks quietly after launch, exposes the result in the menu, and requires explicit confirmation before download and replacement. Replacement uses a same-directory staging bundle and a temporary backup. If the new app cannot be launched, the helper restores and relaunches the previous bundle.
+
+Source-built, ad-hoc signed copies can discover a release and are offered a signed same-version replacement when appropriate, but they can install only a release artifact that passes the same Developer ID and Gatekeeper checks. An unwritable application directory is a non-destructive failure; Homebrew and administrator-owned installations remain managed by their installer.
 
 ## Homebrew tap
 
@@ -52,5 +67,6 @@ The Cask keeps the app's native Login Item across upgrades, relaunches the menu 
 - If GitHub publication fails, fix the cause and create a new patch version and tag. Do not replace a released archive under the same version.
 - If the Homebrew Cask is broken, revert its tap commit or pin it to the last known-good release checksum.
 - If Apple revokes or rejects the artifact, remove the affected release from the supported channel and publish a newly signed patch release.
+- If a native updater defect is discovered, remove the affected release from the supported channel and publish a new patch release. Never replace assets under an existing tag because both the updater and Homebrew rely on immutable version-to-checksum mapping.
 
-The application has no built-in updater in this release architecture. Homebrew and GitHub Releases remain the single packaged-update path until a separately reviewed updater decision supersedes [ADR-0001](docs/adr/0001-signed-releases-and-homebrew.md).
+The native updater decision is documented in [ADR-0002](docs/adr/0002-native-self-updater.md), which partially supersedes [ADR-0001](docs/adr/0001-signed-releases-and-homebrew.md).

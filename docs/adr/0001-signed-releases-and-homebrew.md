@@ -1,6 +1,6 @@
 # ADR-0001: Signed Releases and Homebrew Distribution
 
-**Status:** Accepted
+**Status:** Superseded in part by [ADR-0002](0002-native-self-updater.md)
 
 **Date:** 2026-08-29
 

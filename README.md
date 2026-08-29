@@ -10,7 +10,7 @@ A small native macOS menu-bar companion for Codex CLI. It keeps long-running CLI
 - Registers itself as a native macOS Login Item and reconnects CLI Remote Control after wake or transient network loss.
 - Prevents idle system sleep always, never, or only while an interactive Codex CLI session is active.
 - Shows named active sessions immediately, keeps recent sessions in a nested menu, and provides safe per-session actions.
-- Uses no analytics, privileged helper, root component, or direct network client.
+- Checks its public GitHub Releases feed for updates without analytics, a privileged helper, or a root component.
 
 ## Quick start
 
@@ -24,9 +24,9 @@ The installer builds an ad-hoc signed app, copies it to `~/Applications/Codex Aw
 
 ### Distribution status
 
-Source installation is the supported path until the first Developer ID-signed and Apple-notarized GitHub release is published. The repository already contains the universal release pipeline and Homebrew Cask generator, but it intentionally does not publish an ad-hoc signed binary.
+Source installation is the supported path until the first Developer ID-signed and Apple-notarized GitHub release is published. The repository already contains the universal release pipeline, native updater, and Homebrew Cask generator, but it intentionally does not publish an ad-hoc signed binary. Until that first release exists, the update menu reports **No published release**.
 
-After the first signed release and public tap are available, the intended Homebrew flow is:
+After the first signed release and public tap are available, users can update from the app when it is installed in a writable location such as `~/Applications`, or use Homebrew:
 
 ```bash
 brew tap stslex/tap
@@ -42,7 +42,7 @@ The menu is arranged in four sections:
 1. **Remote Control** — live connection state plus a manual start/reconnect action.
 2. **Active Sessions** — loaded user sessions are shown immediately; recent CLI sessions stay out of the way in a nested **Recent Sessions** menu.
 3. **Awake** — the current power assertion and the three sleep-prevention modes.
-4. **App** — native Launch at Login state, manual refresh, and quit.
+4. **App** — native Launch at Login state, installed version, update status and action, manual refresh, and quit.
 
 The forced-white menu-bar icon is an original terminal-and-network mark. Its terminal body fills while Codex Awake owns a power assertion, and its network nodes fill while CLI Remote Control is connected.
 
@@ -117,12 +117,13 @@ Command-line diagnostics are available from the built executable:
 ./build/Codex\ Awake.app/Contents/MacOS/CodexAwake --list-active-sessions
 ./build/Codex\ Awake.app/Contents/MacOS/CodexAwake --list-sessions
 ./build/Codex\ Awake.app/Contents/MacOS/CodexAwake --remote-start
+./build/Codex\ Awake.app/Contents/MacOS/CodexAwake --check-for-updates
 ./build/Codex\ Awake.app/Contents/MacOS/CodexAwake --login-item-status
 ./build/Codex\ Awake.app/Contents/MacOS/CodexAwake --register-login-item
 ./build/Codex\ Awake.app/Contents/MacOS/CodexAwake --unregister-login-item
 ```
 
-`--detect-sessions`, `--list-active-sessions`, and `--list-sessions` are read-only. `--remote-status` and `--remote-start` both ensure that CLI Remote Control is started before returning its status.
+`--detect-sessions`, `--list-active-sessions`, and `--list-sessions` are local read-only commands. `--check-for-updates` makes a read-only request to this repository's latest GitHub Release. `--remote-status` and `--remote-start` both ensure that CLI Remote Control is started before returning its status.
 
 ## Verify the installation
 
@@ -155,11 +156,15 @@ Use `./scripts/uninstall.sh --purge` to remove the saved mode as well.
 
 Tagged releases are built once in GitHub Actions as a universal app, signed with Developer ID, notarized and stapled by Apple, checked by Gatekeeper, checksummed, and attested before a GitHub Release can be created. Missing credentials or any failed verification stops publication.
 
-Homebrew is the selected update channel for packaged releases. A built-in updater is intentionally deferred so the app does not ship a second framework, signing surface, and update policy before the signed release pipeline exists. See [RELEASING.md](RELEASING.md) and [ADR-0001](docs/adr/0001-signed-releases-and-homebrew.md).
+Codex Awake performs a quiet update check shortly after launch and no more than once every six hours while it remains open. It never downloads or installs an update automatically. When a newer release is available, choose **Install Update ...** in the menu and confirm the operation.
+
+The native updater has no third-party framework or privileged helper. It accepts only the exact immutable ZIP and SHA-256 assets for a stable semantic-version tag in `stslex/codex-cli-awake`, verifies the checksum, bundle identifier, version, code signature, and Gatekeeper assessment, then stages the app beside the current bundle. A short-lived copy of the new signed executable waits for Codex Awake to quit, keeps a rollback copy during replacement, relaunches the new app, and restores the previous bundle if relaunch fails. It does not stop CLI sessions or the managed Remote Control daemon.
+
+Self-update requires the app's parent directory to be writable. A source-built ad-hoc copy can migrate to the signed release even when both have the same semantic version. Homebrew-managed or administrator-owned installations should continue to use `brew upgrade --cask codex-cli-awake`; the in-app action fails without modifying the existing app when replacement is not permitted. See [RELEASING.md](RELEASING.md), [ADR-0001](docs/adr/0001-signed-releases-and-homebrew.md), and [ADR-0002](docs/adr/0002-native-self-updater.md).
 
 ## Privacy and security
 
-Codex Awake has no analytics, privileged helper, or root component. It reads the local process list and Codex state database, calls the public IOKit power-management API, and invokes the locally installed Codex CLI for Remote Control and explicit session actions. Network traffic and authentication remain owned by Codex CLI.
+Codex Awake has no analytics, privileged helper, or root component. It reads the local process list and Codex state database, calls the public IOKit power-management API, and invokes the locally installed Codex CLI for Remote Control and explicit session actions. Remote Control traffic and authentication remain owned by Codex CLI. The only network request made directly by Codex Awake is an unauthenticated HTTPS request to GitHub for release metadata and, after explicit installation confirmation, the selected release archive and checksum.
 
 ## Contributing
 

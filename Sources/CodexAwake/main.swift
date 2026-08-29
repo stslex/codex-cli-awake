@@ -35,6 +35,16 @@ private enum AwakeMode: String, CaseIterable {
     }
 }
 
+private enum AppUpdateState {
+    case idle
+    case checking
+    case noPublishedRelease
+    case upToDate(latestVersion: AppVersion)
+    case available(AppUpdateRelease)
+    case installing(AppUpdateRelease)
+    case failed(String)
+}
+
 private final class SleepAssertion {
     private var assertionID = IOPMAssertionID(0)
     private(set) var isHeld = false
@@ -100,18 +110,23 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private let recentSessionsMenu = NSMenu(title: "Recent Sessions")
     private let awakeStatusItem = NSMenuItem(title: "Checking Codex sessions…", action: nil, keyEquivalent: "")
     private let launchAtLoginItem = NSMenuItem(title: "Launch at Login", action: nil, keyEquivalent: "")
+    private let updateStatusItem = NSMenuItem(title: "Version", action: nil, keyEquivalent: "")
+    private let updateActionItem = NSMenuItem(title: "Check for Updates…", action: nil, keyEquivalent: "")
     private let assertion = SleepAssertion()
     private let detectorQueue = DispatchQueue(label: "com.stslex.CodexAwake.session-detector", qos: .utility)
     private let remoteQueue = DispatchQueue(label: "com.stslex.CodexAwake.remote", qos: .utility)
+    private let updateQueue = DispatchQueue(label: "com.stslex.CodexAwake.updater", qos: .utility)
     private let relativeDateFormatter = RelativeDateTimeFormatter()
     private let profileStore = SessionProfileStore()
     private let loginItemManager = LoginItemManager()
+    private let updateClient = AppUpdateClient()
 
     private var modeItems: [AwakeMode: NSMenuItem] = [:]
     private var activeSessionItems: [NSMenuItem] = []
     private var currentMode: AwakeMode = .activeSession
     private var remoteStatus = RemoteStatus.checking
     private var loginItemStatus = LoginItemStatus(state: .notRegistered, desired: true, detail: nil)
+    private var updateState = AppUpdateState.idle
     private var activeSessions: [CodexSession] = []
     private var recentSessions: [CodexSession] = []
     private var activeSessionCount = 0
@@ -119,6 +134,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var scanInProgress = false
     private var remoteWorkInProgress = false
     private var lastRemoteRefresh: Date?
+    private var lastUpdateCheck: Date?
     private var sessionTimer: Timer?
     private var remoteTimer: Timer?
 
@@ -131,6 +147,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         applyMode()
         scanForSessions()
         refreshRemoteAndSessions(force: true)
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+            self?.checkForUpdatesIfNeeded()
+        }
 
         let sessionTimer = Timer(timeInterval: 3.0, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.scanForSessions() }
@@ -155,6 +175,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         loginItemStatus = loginItemManager.status()
         scanForSessions()
         refreshRemoteAndSessions(force: false)
+        checkForUpdatesIfNeeded()
         updatePresentation()
     }
 
@@ -208,6 +229,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         launchAtLoginItem.action = #selector(toggleLaunchAtLogin)
         launchAtLoginItem.isEnabled = true
         menu.addItem(launchAtLoginItem)
+
+        configureStatusItem(updateStatusItem)
+        menu.addItem(updateStatusItem)
+
+        updateActionItem.target = self
+        updateActionItem.action = #selector(performUpdateAction)
+        updateActionItem.isEnabled = true
+        menu.addItem(updateActionItem)
 
         let refreshItem = NSMenuItem(title: "Refresh", action: #selector(refreshNow), keyEquivalent: "r")
         refreshItem.target = self
@@ -303,6 +332,17 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         if let detail = loginItemStatus.detail,
            loginItemStatus.state != .requiresApproval {
             showError("Launch at Login could not be updated:\n\(detail)")
+        }
+    }
+
+    @objc private func performUpdateAction() {
+        switch updateState {
+        case let .available(release):
+            offerToInstall(release)
+        case .checking, .installing:
+            return
+        case .idle, .noPublishedRelease, .upToDate, .failed:
+            checkForUpdates(userInitiated: true)
         }
     }
 
@@ -465,6 +505,148 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         alert.runModal()
     }
 
+    private func checkForUpdatesIfNeeded() {
+        guard let lastUpdateCheck else {
+            checkForUpdates(userInitiated: false)
+            return
+        }
+        if Date().timeIntervalSince(lastUpdateCheck) >= 6 * 60 * 60 {
+            checkForUpdates(userInitiated: false)
+        }
+    }
+
+    private func checkForUpdates(userInitiated: Bool) {
+        switch updateState {
+        case .checking, .installing:
+            return
+        case .idle, .noPublishedRelease, .upToDate, .available, .failed:
+            break
+        }
+
+        let currentVersion = appVersion
+        let updateClient = updateClient
+        let currentBundleURL = Bundle.main.bundleURL
+        updateState = .checking
+        updatePresentation()
+
+        updateQueue.async { [weak self] in
+            guard let self else { return }
+            do {
+                let availability = try updateClient.check(
+                    currentVersion: currentVersion,
+                    allowSameVersionUpgrade: updateClient.requiresSignedReleaseMigration(
+                        at: currentBundleURL
+                    )
+                )
+                DispatchQueue.main.async {
+                    self.lastUpdateCheck = Date()
+                    switch availability {
+                    case .noPublishedRelease:
+                        self.updateState = .noPublishedRelease
+                        if userInitiated {
+                            self.showUpdateInformation(
+                                title: "No Published Updates",
+                                detail: "No signed Codex Awake release has been published yet."
+                            )
+                        }
+                    case let .upToDate(latestVersion):
+                        self.updateState = .upToDate(latestVersion: latestVersion)
+                        if userInitiated {
+                            self.showUpdateInformation(
+                                title: "Codex Awake Is Up to Date",
+                                detail: "Version \(currentVersion) is the newest published release."
+                            )
+                        }
+                    case let .available(release):
+                        self.updateState = .available(release)
+                        if userInitiated {
+                            self.offerToInstall(release)
+                        }
+                    }
+                    self.updatePresentation()
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.lastUpdateCheck = Date()
+                    self.updateState = .failed(error.localizedDescription)
+                    self.updatePresentation()
+                    if userInitiated {
+                        self.showError("Update check failed:\n\(error.localizedDescription)")
+                    }
+                }
+            }
+        }
+    }
+
+    private func offerToInstall(_ release: AppUpdateRelease) {
+        let alert = NSAlert()
+        let replacesSourceBuild = release.version.description == appVersion
+        alert.messageText = replacesSourceBuild
+            ? "Install the signed Codex Awake \(release.version) release?"
+            : "Install Codex Awake \(release.version)?"
+        var detail = replacesSourceBuild
+            ? "This source-built copy will be replaced by the Developer ID-signed and notarized release of the same version. The release will be downloaded from GitHub, verified, installed, and then Codex Awake will relaunch. Active Codex CLI sessions and the Remote Control daemon will keep running."
+            : "The notarized update will be downloaded from GitHub, verified, installed, and then Codex Awake will relaunch. Active Codex CLI sessions and the Remote Control daemon will keep running."
+        if let notes = release.releaseNotes,
+           !notes.isEmpty {
+            detail += "\n\n" + compact(notes, maximumLength: 900)
+        }
+        alert.informativeText = detail
+        alert.addButton(withTitle: "Install and Relaunch")
+        alert.addButton(withTitle: "Not Now")
+        alert.addButton(withTitle: "View Release")
+        NSApp.activate(ignoringOtherApps: true)
+
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            install(release)
+        case .alertThirdButtonReturn:
+            NSWorkspace.shared.open(release.releasePageURL)
+        default:
+            break
+        }
+    }
+
+    private func install(_ release: AppUpdateRelease) {
+        let targetBundleURL = Bundle.main.bundleURL
+        let updateClient = updateClient
+        let processID = ProcessInfo.processInfo.processIdentifier
+        updateState = .installing(release)
+        updatePresentation()
+
+        updateQueue.async { [weak self] in
+            guard let self else { return }
+            do {
+                let prepared = try updateClient.prepare(
+                    release: release,
+                    replacing: targetBundleURL
+                )
+                try updateClient.launchInstaller(
+                    for: prepared,
+                    waitingFor: processID
+                )
+                DispatchQueue.main.async {
+                    NSApp.terminate(nil)
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.updateState = .failed(error.localizedDescription)
+                    self.updatePresentation()
+                    self.showError("Update installation failed:\n\(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    private func showUpdateInformation(title: String, detail: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = detail
+        alert.addButton(withTitle: "OK")
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
+    }
+
     private func scanForSessions() {
         guard !scanInProgress else { return }
         scanInProgress = true
@@ -535,6 +717,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         updateSessionPresentation()
         updateAwakePresentation()
         updateLoginItemPresentation()
+        updateUpdatePresentation()
 
         guard let button = statusItem.button else { return }
         button.image = StatusIconFactory.make(
@@ -771,6 +954,63 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         launchAtLoginItem.toolTip = loginItemStatus.detail
     }
 
+    private func updateUpdatePresentation() {
+        let version = appVersion
+        updateStatusItem.image = menuSymbol("shippingbox")
+        updateStatusItem.toolTip = nil
+
+        switch updateState {
+        case .idle:
+            updateStatusItem.title = "Version \(version)"
+            updateActionItem.title = "Check for Updates…"
+            updateActionItem.image = menuSymbol("arrow.triangle.2.circlepath")
+            updateActionItem.isEnabled = true
+        case .checking:
+            updateStatusItem.title = "Version \(version) · Checking…"
+            updateActionItem.title = "Checking for Updates…"
+            updateActionItem.image = menuSymbol("arrow.triangle.2.circlepath")
+            updateActionItem.isEnabled = false
+        case .noPublishedRelease:
+            updateStatusItem.title = "Version \(version) · No published release"
+            updateActionItem.title = "Check for Updates…"
+            updateActionItem.image = menuSymbol("arrow.triangle.2.circlepath")
+            updateActionItem.isEnabled = true
+        case .upToDate:
+            updateStatusItem.title = "Version \(version) · Up to date"
+            updateActionItem.title = "Check for Updates…"
+            updateActionItem.image = menuSymbol("checkmark.circle")
+            updateActionItem.isEnabled = true
+        case let .available(release):
+            if release.version.description == version {
+                updateStatusItem.title = "Version \(version) · Signed release available"
+                updateActionItem.title = "Install Signed Release \(release.version)…"
+            } else {
+                updateStatusItem.title = "Version \(version) · \(release.version) available"
+                updateActionItem.title = "Install Update \(release.version)…"
+            }
+            updateStatusItem.image = menuSymbol("arrow.down.circle.fill")
+            updateActionItem.image = menuSymbol("square.and.arrow.down")
+            updateActionItem.isEnabled = true
+        case let .installing(release):
+            updateStatusItem.title = "Version \(version) · Installing \(release.version)…"
+            updateStatusItem.image = menuSymbol("arrow.down.circle.fill")
+            updateActionItem.title = "Installing Update…"
+            updateActionItem.image = menuSymbol("hourglass")
+            updateActionItem.isEnabled = false
+        case let .failed(detail):
+            updateStatusItem.title = "Version \(version) · Update failed"
+            updateStatusItem.image = menuSymbol("exclamationmark.triangle.fill")
+            updateStatusItem.toolTip = detail
+            updateActionItem.title = "Check for Updates…"
+            updateActionItem.image = menuSymbol("arrow.triangle.2.circlepath")
+            updateActionItem.isEnabled = true
+        }
+    }
+
+    private var appVersion: String {
+        AppUpdateClient.currentVersion()
+    }
+
     private func compact(_ value: String, maximumLength: Int) -> String {
         guard value.count > maximumLength else { return value }
         return String(value.prefix(maximumLength - 1)) + "…"
@@ -789,9 +1029,46 @@ private func printJSON<T: Encodable>(_ value: T) {
 }
 
 let arguments = CommandLine.arguments
+if arguments.contains("--apply-update") {
+    guard let updateRequest = AppUpdateApplyRequest(arguments: arguments) else {
+        fputs("Invalid update helper arguments.\n", stderr)
+        exit(EXIT_FAILURE)
+    }
+    exit(AppUpdateHelper.apply(updateRequest))
+}
 if arguments.contains("--detect-sessions") {
     print(CodexSessionDetector.activeSessionCount())
     exit(EXIT_SUCCESS)
+}
+if arguments.contains("--update-archive-name") {
+    guard let version = AppVersion(AppUpdateClient.currentVersion()) else {
+        fputs("Invalid application version.\n", stderr)
+        exit(EXIT_FAILURE)
+    }
+    print(AppUpdateClient.archiveName(version: version))
+    exit(EXIT_SUCCESS)
+}
+if arguments.contains("--check-for-updates") {
+    let currentVersion = AppUpdateClient.currentVersion()
+    do {
+        let client = AppUpdateClient()
+        let availability = try client.check(
+            currentVersion: currentVersion,
+            allowSameVersionUpgrade: client.requiresSignedReleaseMigration(
+                at: Bundle.main.bundleURL
+            )
+        )
+        printJSON(
+            AppUpdateCommandStatus.make(
+                currentVersion: currentVersion,
+                availability: availability
+            )
+        )
+        exit(EXIT_SUCCESS)
+    } catch {
+        printJSON(AppUpdateCommandStatus.failure(currentVersion: currentVersion, error: error))
+        exit(EXIT_FAILURE)
+    }
 }
 if arguments.contains("--remote-status") {
     let status = CodexRemoteBridge.ensureRemoteStarted()

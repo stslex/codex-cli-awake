@@ -15,6 +15,20 @@ launch_agent="${launch_agents_dir}/${label}.plist"
 legacy_remote_launch_agent="${launch_agents_dir}/${legacy_remote_label}.plist"
 log_dir="${HOME}/.codex/log"
 installed_executable="${installed_app}/Contents/MacOS/CodexAwake"
+restore_existing_app_on_failure=false
+
+restore_existing_app() {
+    local exit_status=$?
+    if [[ "${exit_status}" -eq 0 || "${restore_existing_app_on_failure}" != true ]]; then
+        return
+    fi
+    if [[ -x "${installed_executable}" ]]; then
+        "${installed_executable}" --register-login-item >/dev/null 2>&1 || true
+        /usr/bin/open -g "${installed_app}" >/dev/null 2>&1 || true
+    fi
+}
+
+trap restore_existing_app EXIT
 
 supports_login_item_cli() {
     local executable="$1"
@@ -33,7 +47,7 @@ stop_running_app() {
     done <<< "${stale_pids}"
 
     for _ in {1..20}; do
-        pgrep -x CodexAwake >/dev/null 2>&1 || return
+        pgrep -x CodexAwake >/dev/null 2>&1 || return 0
         sleep 0.1
     done
 
@@ -73,6 +87,7 @@ if launchctl print "${launch_domain}/${legacy_remote_label}" >/dev/null 2>&1; th
 fi
 rm -f -- "${legacy_remote_launch_agent}"
 
+restore_existing_app_on_failure=true
 if supports_login_item_cli "${installed_executable}"; then
     "${installed_executable}" --unregister-login-item >/dev/null 2>&1 || true
 fi
@@ -107,6 +122,7 @@ case "${registration_exit}" in
         ;;
 esac
 rm -f -- "${registration_output}"
+restore_existing_app_on_failure=false
 
 echo "Installed ${installed_app}"
 echo "${login_message}"
