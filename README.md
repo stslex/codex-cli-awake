@@ -1,6 +1,26 @@
 # Codex CLI Awake
 
-A native macOS menu-bar companion for Codex CLI. It keeps active CLI work awake, shows the CLI Remote Control connection, lists recent named sessions, and provides safe Remote and sleep controls in one menu.
+[![Build](https://github.com/stslex/codex-cli-awake/actions/workflows/build.yml/badge.svg)](https://github.com/stslex/codex-cli-awake/actions/workflows/build.yml)
+[![macOS 13+](https://img.shields.io/badge/macOS-13%2B-black?logo=apple)](https://www.apple.com/macos/)
+[![Swift 5.9+](https://img.shields.io/badge/Swift-5.9%2B-F05138?logo=swift&logoColor=white)](https://www.swift.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+A small native macOS menu-bar companion for Codex CLI. It keeps long-running CLI work awake, owns the local CLI Remote Control connection, and makes active and recent sessions visible without opening another full application.
+
+- Starts at login and reconnects CLI Remote Control after wake or transient network loss.
+- Prevents idle system sleep always, never, or only while an interactive Codex CLI session is active.
+- Shows named active sessions immediately and keeps recent sessions in a nested menu.
+- Uses no analytics, privileged helper, root component, or direct network client.
+
+## Quick start
+
+```bash
+git clone https://github.com/stslex/codex-cli-awake.git
+cd codex-cli-awake
+./scripts/install.sh
+```
+
+The installer builds an ad-hoc signed app, copies it to `~/Applications/Codex Awake.app`, registers its per-user LaunchAgent, and starts it immediately. The default Awake mode for a new installation is **On active session**.
 
 ## Menu
 
@@ -39,16 +59,6 @@ See the official [Remote connections documentation](https://learn.chatgpt.com/do
 - macOS 13 or later
 - A Codex CLI version that provides `remote-control` and managed `app-server daemon` commands
 - Xcode Command Line Tools or Xcode with Swift 5.9 or later to build from source
-
-## Install
-
-```bash
-git clone https://github.com/stslex/codex-cli-awake.git
-cd codex-cli-awake
-./scripts/install.sh
-```
-
-The installer builds an ad-hoc signed app, copies it to `~/Applications/Codex Awake.app`, installs a user LaunchAgent, removes the obsolete standalone Remote watchdog LaunchAgent if present, and starts the app immediately. The default mode for a new installation is **On active session**.
 
 ## Build without installing
 
@@ -94,6 +104,7 @@ Use `./scripts/uninstall.sh --purge` to remove the saved mode as well.
 - Closing the MacBook lid still follows macOS clamshell rules.
 - Active user sessions are identified from rollout files currently held open by the managed app-server. Service and sub-agent rollouts are excluded.
 - Session names and working directories come from the local Codex state database and remain on the Mac.
+- The installer removes the obsolete standalone `com.stslex.codex-remote-control` LaunchAgent so Codex Awake is the single login-start owner.
 
 ## Privacy and security
 
