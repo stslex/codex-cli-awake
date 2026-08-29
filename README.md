@@ -9,7 +9,7 @@ A small native macOS menu-bar companion for Codex CLI. It keeps long-running CLI
 
 - Registers itself as a native macOS Login Item and reconnects CLI Remote Control after wake or transient network loss.
 - Prevents idle system sleep always, never, or only while an interactive Codex CLI session is active.
-- Shows named active sessions immediately, keeps recent sessions in a nested menu, and provides safe per-session actions.
+- Shows named active sessions immediately, keeps recent sessions in a nested menu, and provides safe per-session actions, including returning to the exact terminal that owns a live CLI session.
 - Checks its public GitHub Releases feed for updates without analytics, a privileged helper, or a root component.
 
 ## Quick start
@@ -44,12 +44,14 @@ The menu is arranged in four sections:
 3. **Awake** — the current power assertion and the three sleep-prevention modes.
 4. **App** — native Launch at Login state, installed version, update status and action, manual refresh, and quit.
 
-The forced-white menu-bar icon is an original terminal-and-network mark. Its terminal body fills while Codex Awake owns a power assertion, and its network nodes fill while CLI Remote Control is connected.
+The forced-white menu-bar icon combines a terminal with a small cloud in its upper-right corner. The terminal body fills while Codex Awake owns a power assertion, and the cloud fades when CLI Remote Control is disconnected.
 
 ## Session actions
 
 Each active or recent session opens a native submenu instead of launching a command immediately:
 
+- **Focus in Terminal** returns to the exact Ghostty, Terminal, or iTerm2 surface that owns an active CLI process.
+- **Open in Terminal** appears for a Remote-active session whose original local terminal is no longer available and attaches it to a new Terminal window.
 - **Open in ChatGPT** opens the exact `codex://threads/<session-id>` deep link.
 - **Resume in Terminal** is available only for recent sessions, so an already-active session is never resumed twice.
 - **Fork in New Terminal** creates an independent continuation of an active or recent session.
@@ -57,7 +59,9 @@ Each active or recent session opens a native submenu instead of launching a comm
 - **Copy** exposes the session name, ID, working directory, and ChatGPT deep link.
 - **Archive Session** is available only for recent sessions and always requires confirmation. Delete and Stop actions are intentionally not exposed.
 
-Resume and Fork open the built-in Terminal app. macOS may ask once for permission to let Codex Awake control Terminal.
+Focus matches the active Codex process to its TTY before activating a terminal surface. Terminal and iTerm2 expose that TTY directly. For Ghostty, Codex Awake briefly assigns a unique title to the exact TTY, focuses the one matching surface through Ghostty's native AppleScript interface, and immediately restores the previous title. It never guesses between ambiguous active processes.
+
+Open, Resume, and Fork launch the built-in Terminal app. macOS may ask once for permission to let Codex Awake control Ghostty, Terminal, or iTerm2.
 
 ### Per-session profiles
 
@@ -108,6 +112,8 @@ See the official [Remote connections documentation](https://learn.chatgpt.com/do
 ```
 
 The app bundle is written to `build/Codex Awake.app`. The first command builds for the current Mac; `--universal` builds one `arm64` and `x86_64` bundle.
+
+The build also renders the code-native application artwork into a complete macOS `.icns` resource. The same terminal-and-cloud icon is assigned explicitly to native alerts, including update dialogs.
 
 Command-line diagnostics are available from the built executable:
 

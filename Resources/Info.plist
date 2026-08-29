@@ -10,6 +10,8 @@
     <string>CodexAwake</string>
     <key>CFBundleIdentifier</key>
     <string>com.stslex.CodexAwake</string>
+    <key>CFBundleIconFile</key>
+    <string>CodexAwake</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
@@ -17,9 +19,9 @@
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.4.0</string>
+    <string>1.5.0</string>
     <key>CFBundleVersion</key>
-    <string>5</string>
+    <string>6</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>LSUIElement</key>
@@ -27,6 +29,6 @@
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSAppleEventsUsageDescription</key>
-    <string>Codex Awake uses Terminal to resume or fork the session you choose.</string>
+    <string>Codex Awake uses your terminal app to focus, resume, or fork the session you choose.</string>
 </dict>
 </plist>

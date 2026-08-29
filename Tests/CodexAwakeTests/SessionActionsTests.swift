@@ -77,6 +77,65 @@ final class SessionActionsTests: XCTestCase {
         XCTAssertTrue(resolved.isEmpty)
     }
 
+    func testProcessResolutionMatchesExplicitSessionID() {
+        let sessionID = "01a04c8f-1234-5678-9abc-123456789abc"
+        let process = InteractiveCodexProcess(
+            pid: 100,
+            tty: "ttys001",
+            command: "codex resume \(sessionID)",
+            sessionID: sessionID,
+            profile: .named("workeeper")
+        )
+
+        let resolved = CodexProcessInspector.resolvedProcesses(
+            activeSessionIDs: [sessionID],
+            processes: [process]
+        )
+
+        XCTAssertEqual(resolved[sessionID], process)
+    }
+
+    func testProcessResolutionMatchesOnlyRemainingAnonymousProcess() {
+        let explicitID = "01a04c8f-1234-5678-9abc-123456789abc"
+        let anonymousID = "01a0490f-1234-5678-9abc-123456789abc"
+        let explicit = InteractiveCodexProcess(
+            pid: 100,
+            tty: "ttys001",
+            command: "codex resume \(explicitID)",
+            sessionID: explicitID,
+            profile: .named("workeeper")
+        )
+        let anonymous = InteractiveCodexProcess(
+            pid: 101,
+            tty: "ttys002",
+            command: "codex resume",
+            sessionID: nil,
+            profile: .named("workeeper")
+        )
+
+        let resolved = CodexProcessInspector.resolvedProcesses(
+            activeSessionIDs: [explicitID, anonymousID],
+            processes: [anonymous, explicit]
+        )
+
+        XCTAssertEqual(resolved[explicitID], explicit)
+        XCTAssertEqual(resolved[anonymousID], anonymous)
+    }
+
+    func testProcessResolutionDoesNotGuessBetweenAnonymousProcesses() {
+        let processes = [
+            InteractiveCodexProcess(pid: 1, tty: "ttys001", command: "codex", sessionID: nil, profile: .defaultProfile),
+            InteractiveCodexProcess(pid: 2, tty: "ttys002", command: "codex", sessionID: nil, profile: .defaultProfile)
+        ]
+
+        let resolved = CodexProcessInspector.resolvedProcesses(
+            activeSessionIDs: ["one", "two"],
+            processes: processes
+        )
+
+        XCTAssertTrue(resolved.isEmpty)
+    }
+
     func testResumeArgumentsPreserveNamedProfile() {
         let arguments = CodexSessionCommand.arguments(
             action: .resume,
@@ -124,5 +183,47 @@ final class SessionActionsTests: XCTestCase {
         XCTAssertEqual(store.profile(for: "thread"), .defaultProfile)
         store.set(.named("workeeper"), for: "thread")
         XCTAssertEqual(store.profile(for: "thread"), .named("workeeper"))
+    }
+
+    func testTerminalProgramDetectionUsesProcessEnvironment() {
+        XCTAssertEqual(
+            TerminalProgram.detect(in: "codex TERM_PROGRAM=ghostty TERM=xterm-ghostty"),
+            .ghostty
+        )
+        XCTAssertEqual(
+            TerminalProgram.detect(in: "codex TERM_PROGRAM=Apple_Terminal"),
+            .appleTerminal
+        )
+        XCTAssertEqual(
+            TerminalProgram.detect(in: "codex TERM_PROGRAM=iTerm.app"),
+            .iTerm2
+        )
+        XCTAssertEqual(TerminalProgram.detect(in: "codex TERM=xterm-256color"), .unknown)
+    }
+
+    func testGhosttyFocusScriptTargetsUniqueTemporaryTitle() {
+        let script = TerminalSessionFocuser.ghosttyFocusScript(marker: "Focus \"thread\"")
+
+        XCTAssertTrue(script.contains("every terminal whose name is \"Focus \\\"thread\\\"\""))
+        XCTAssertTrue(script.contains("focus item 1 of matches"))
+        XCTAssertTrue(script.contains("delay 0.025"))
+    }
+
+    func testAppleTerminalFocusScriptTargetsExactTTY() {
+        let script = TerminalSessionFocuser.appleTerminalFocusScript(ttyPath: "/dev/ttys001")
+
+        XCTAssertTrue(script.contains("if tty of terminalTab is \"/dev/ttys001\""))
+        XCTAssertTrue(script.contains("set selected tab of terminalWindow to terminalTab"))
+        XCTAssertTrue(script.contains("activate"))
+    }
+
+    func testGhosttyTitleProbePushesAndRestoresTitle() {
+        let sequence = TerminalSessionFocuser.titleProbeSequence(marker: "thread\u{07}\u{1B}")
+
+        XCTAssertTrue(sequence.hasPrefix("\u{1B}[22;2t\u{1B}]2;"))
+        XCTAssertTrue(sequence.hasSuffix("\u{07}"))
+        XCTAssertFalse(sequence.dropFirst("\u{1B}[22;2t\u{1B}]2;".count).dropLast().contains("\u{07}"))
+        XCTAssertFalse(sequence.dropFirst("\u{1B}[22;2t\u{1B}]2;".count).dropLast().contains("\u{1B}"))
+        XCTAssertEqual(TerminalSessionFocuser.restoreTitleSequence, "\u{1B}[23;2t")
     }
 }

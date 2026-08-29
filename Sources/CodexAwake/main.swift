@@ -129,6 +129,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var updateState = AppUpdateState.idle
     private var activeSessions: [CodexSession] = []
     private var recentSessions: [CodexSession] = []
+    private var activeSessionProcesses: [String: InteractiveCodexProcess] = [:]
     private var activeSessionCount = 0
     private var sessionsLoaded = false
     private var scanInProgress = false
@@ -140,6 +141,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        NSApp.applicationIconImage = AppIconFactory.make(
+            size: NSSize(width: 256, height: 256)
+        )
         relativeDateFormatter.unitsStyle = .abbreviated
         configureMenu()
         loadMode()
@@ -357,6 +361,32 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
     }
 
+    @objc private func focusSessionInTerminal(_ sender: NSMenuItem) {
+        guard let session = sender.representedObject as? CodexSession else { return }
+        guard let process = activeSessionProcesses[session.id] else {
+            showError("The active Codex process could not be matched to this session. Refresh the menu and try again.")
+            return
+        }
+
+        detectorQueue.async { [weak self] in
+            let result = TerminalSessionFocuser.focus(
+                process: process,
+                sessionID: session.id,
+                sessionName: session.displayName
+            )
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if result.terminationStatus != 0 {
+                    self.showError(
+                        result.combinedOutput.isEmpty
+                            ? "The terminal for this Codex session could not be focused."
+                            : result.combinedOutput
+                    )
+                }
+            }
+        }
+    }
+
     @objc private func resumeSession(_ sender: NSMenuItem) {
         guard let session = sender.representedObject as? CodexSession else { return }
         launchSession(session, action: .resume)
@@ -398,8 +428,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     @objc private func archiveSession(_ sender: NSMenuItem) {
         guard let session = sender.representedObject as? CodexSession else { return }
 
-        let alert = NSAlert()
-        alert.alertStyle = .warning
+        let alert = appAlert(style: .warning)
         alert.messageText = "Archive this Codex session?"
         alert.informativeText = "“\(session.displayName)” will be removed from Recent Sessions. You can unarchive it later with Codex CLI."
         alert.addButton(withTitle: "Archive")
@@ -478,7 +507,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             popUp.selectItem(at: index)
         }
 
-        let alert = NSAlert()
+        let alert = appAlert()
         alert.messageText = current == nil ? "Choose this session's Codex profile" : "Session profile"
         alert.informativeText = "Codex does not store the --profile name in thread metadata. Choose the profile originally used by “\(session.displayName)”. Codex Awake will remember it for Resume and Fork."
         alert.accessoryView = popUp
@@ -496,8 +525,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     private func showError(_ message: String) {
-        let alert = NSAlert()
-        alert.alertStyle = .warning
+        let alert = appAlert(style: .warning)
         alert.messageText = "Codex Awake"
         alert.informativeText = message
         alert.addButton(withTitle: "OK")
@@ -579,7 +607,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     private func offerToInstall(_ release: AppUpdateRelease) {
-        let alert = NSAlert()
+        let alert = appAlert()
         let replacesSourceBuild = release.version.description == appVersion
         alert.messageText = replacesSourceBuild
             ? "Install the signed Codex Awake \(release.version) release?"
@@ -639,7 +667,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     private func showUpdateInformation(title: String, detail: String) {
-        let alert = NSAlert()
+        let alert = appAlert()
         alert.messageText = title
         alert.informativeText = detail
         alert.addButton(withTitle: "OK")
@@ -675,7 +703,16 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         remoteQueue.async { [weak self] in
             let status = CodexRemoteBridge.ensureRemoteStarted()
             let activeSessions = CodexRemoteBridge.activeSessions(limit: maximumVisibleSessions)
-            let discoveredProfiles = CodexRemoteBridge.discoveredProfiles(for: activeSessions)
+            let liveProcesses = CodexProcessInspector.liveProcesses()
+            let activeSessionIDs = activeSessions.map(\.id)
+            let discoveredProfiles = CodexProcessInspector.resolvedProfiles(
+                activeSessionIDs: activeSessionIDs,
+                processes: liveProcesses
+            )
+            let activeSessionProcesses = CodexProcessInspector.resolvedProcesses(
+                activeSessionIDs: activeSessionIDs,
+                processes: liveProcesses
+            )
             let activeIDs = Set(activeSessions.map(\.id))
             let recentSessions = CodexRemoteBridge
                 .recentSessions(limit: maximumVisibleSessions + activeIDs.count)
@@ -687,6 +724,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                 self.remoteStatus = status
                 self.activeSessions = activeSessions
                 self.recentSessions = Array(recentSessions)
+                self.activeSessionProcesses = activeSessionProcesses
                 for (sessionID, profile) in discoveredProfiles {
                     self.profileStore.set(profile, for: sessionID)
                 }
@@ -835,6 +873,22 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private func sessionActionsMenu(for session: CodexSession, isActive: Bool) -> NSMenu {
         let actions = NSMenu(title: session.displayName)
         actions.autoenablesItems = false
+
+        if isActive, activeSessionProcesses[session.id] != nil {
+            actions.addItem(sessionActionItem(
+                title: "Focus in Terminal",
+                symbol: "scope",
+                action: #selector(focusSessionInTerminal(_:)),
+                session: session
+            ))
+        } else if isActive {
+            actions.addItem(sessionActionItem(
+                title: "Open in Terminal",
+                symbol: "play.fill",
+                action: #selector(resumeSession(_:)),
+                session: session
+            ))
+        }
 
         actions.addItem(sessionActionItem(
             title: "Open in ChatGPT",
@@ -1011,6 +1065,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         AppUpdateClient.currentVersion()
     }
 
+    private func appAlert(style: NSAlert.Style = .informational) -> NSAlert {
+        let alert = NSAlert()
+        alert.alertStyle = style
+        alert.icon = NSApp.applicationIconImage ?? AppIconFactory.make(
+            size: NSSize(width: 128, height: 128)
+        )
+        return alert
+    }
+
     private func compact(_ value: String, maximumLength: Int) -> String {
         guard value.count > maximumLength else { return value }
         return String(value.prefix(maximumLength - 1)) + "…"
@@ -1047,6 +1110,32 @@ if arguments.contains("--update-archive-name") {
     }
     print(AppUpdateClient.archiveName(version: version))
     exit(EXIT_SUCCESS)
+}
+if let renderIconIndex = arguments.firstIndex(of: "--render-app-icon"),
+   arguments.indices.contains(renderIconIndex + 1) {
+    let destination = URL(fileURLWithPath: arguments[renderIconIndex + 1])
+    do {
+        try AppIconFactory.writePNG(to: destination, pixelSize: 1_024)
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("Could not render application icon: \(error.localizedDescription)\n", stderr)
+        exit(EXIT_FAILURE)
+    }
+}
+if let renderStatusIconIndex = arguments.firstIndex(of: "--render-status-icon"),
+   arguments.indices.contains(renderStatusIconIndex + 1) {
+    let destination = URL(fileURLWithPath: arguments[renderStatusIconIndex + 1])
+    do {
+        try StatusIconFactory.writePreviewPNG(
+            to: destination,
+            assertionActive: true,
+            remoteConnected: true
+        )
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("Could not render status icon: \(error.localizedDescription)\n", stderr)
+        exit(EXIT_FAILURE)
+    }
 }
 if arguments.contains("--check-for-updates") {
     let currentVersion = AppUpdateClient.currentVersion()
