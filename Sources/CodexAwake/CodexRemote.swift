@@ -5,6 +5,7 @@ enum RemoteConnectionState: String, Codable {
     case disabled
     case connecting
     case connected
+    case managed
     case errored
     case unavailable
 }
@@ -39,6 +40,25 @@ struct CodexSession: Codable {
     }
 }
 
+enum CodexSessionMenuPresentation {
+    static func title(for session: CodexSession, maximumLength: Int = 44) -> String {
+        let safeMaximumLength = max(maximumLength, 16)
+        let projectName = URL(fileURLWithPath: session.cwd).lastPathComponent
+        let fullTitle = "\(session.displayName) · \(projectName)"
+        guard fullTitle.count > safeMaximumLength else { return fullTitle }
+
+        let separator = " · "
+        let project = compact(projectName, maximumLength: min(18, safeMaximumLength / 2))
+        let nameLength = max(8, safeMaximumLength - separator.count - project.count)
+        return "\(compact(session.displayName, maximumLength: nameLength))\(separator)\(project)"
+    }
+
+    private static func compact(_ value: String, maximumLength: Int) -> String {
+        guard value.count > maximumLength else { return value }
+        return String(value.prefix(maximumLength - 1)) + "…"
+    }
+}
+
 private struct RemoteStartResponse: Decodable {
     let status: String
     let serverName: String?
@@ -55,6 +75,63 @@ struct CommandResult {
         [standardOutput, standardError]
             .filter { !$0.isEmpty }
             .joined(separator: "\n")
+    }
+}
+
+enum CodexSessionQuery {
+    static func loaded(threadIDs: [String], limit: Int) -> String {
+        let safeLimit = min(max(limit, 1), 20)
+        let quotedIDs = threadIDs.map(sqlQuoted).joined(separator: ",")
+        return """
+        SELECT
+            id,
+            CASE
+                WHEN trim(COALESCE(name, '')) <> '' THEN substr(replace(replace(name, char(10), ' '), char(13), ' '), 1, 80)
+                WHEN trim(COALESCE(title, '')) <> '' THEN substr(replace(replace(title, char(10), ' '), char(13), ' '), 1, 80)
+                WHEN trim(COALESCE(preview, '')) <> '' THEN substr(replace(replace(preview, char(10), ' '), char(13), ' '), 1, 80)
+                ELSE substr(id, 1, 8)
+            END AS display_name,
+            cwd,
+            CASE WHEN recency_at > 0 THEN recency_at ELSE updated_at END AS recency_at
+        FROM threads
+        WHERE id IN (\(quotedIDs))
+          AND archived = 0
+          AND COALESCE(thread_source, 'user') = 'user'
+          AND trim(COALESCE(agent_role, '')) = ''
+        ORDER BY recency_at DESC, id DESC
+        LIMIT \(safeLimit);
+        """
+    }
+
+    static func recent(limit: Int) -> String {
+        let safeLimit = min(max(limit, 1), 20)
+        return """
+        SELECT
+            id,
+            CASE
+                WHEN trim(COALESCE(name, '')) <> '' THEN substr(replace(replace(name, char(10), ' '), char(13), ' '), 1, 80)
+                WHEN trim(COALESCE(title, '')) <> '' THEN substr(replace(replace(title, char(10), ' '), char(13), ' '), 1, 80)
+                WHEN trim(COALESCE(preview, '')) <> '' THEN substr(replace(replace(preview, char(10), ' '), char(13), ' '), 1, 80)
+                ELSE substr(id, 1, 8)
+            END AS display_name,
+            cwd,
+            CASE WHEN recency_at > 0 THEN recency_at ELSE updated_at END AS recency_at
+        FROM threads
+        WHERE archived = 0
+          AND COALESCE(thread_source, 'user') = 'user'
+          AND trim(COALESCE(agent_role, '')) = ''
+          AND (
+              trim(COALESCE(name, '')) <> ''
+              OR trim(COALESCE(title, '')) <> ''
+              OR trim(COALESCE(preview, '')) <> ''
+          )
+        ORDER BY recency_at DESC, id DESC
+        LIMIT \(safeLimit);
+        """
+    }
+
+    private static func sqlQuoted(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "''") + "'"
     }
 }
 
@@ -155,32 +232,42 @@ enum CodexRemoteBridge {
         )
     }
 
+    static func stopTerminalRemoteControl() -> String? {
+        guard let codexBinary else { return "Codex CLI was not found" }
+        return stopTerminalRemoteControl(
+            executable: codexBinary,
+            commandRunner: CommandRunner.run
+        )
+    }
+
+    static func stopTerminalRemoteControl(
+        executable: URL,
+        commandRunner: (URL, [String]) -> CommandResult
+    ) -> String? {
+        let result = commandRunner(
+            executable,
+            ["remote-control", "stop", "--json"]
+        )
+        guard result.terminationStatus != 0 else { return nil }
+        return friendlyRemoteError(result.combinedOutput)
+    }
+
+    static func desktopManagedStatus(isDesktopRunning: Bool) -> RemoteStatus {
+        RemoteStatus(
+            state: isDesktopRunning ? .managed : .unavailable,
+            serverName: nil,
+            environmentID: nil,
+            detail: isDesktopRunning
+                ? "Managed by Codex Desktop"
+                : "Codex Desktop is not running",
+            configuredEnabled: true
+        )
+    }
+
     static func recentSessions(limit: Int = 6) -> [CodexSession] {
         guard fileManager.fileExists(atPath: stateDatabaseURL.path) else { return [] }
 
-        let safeLimit = min(max(limit, 1), 20)
-        let query = """
-        SELECT
-            id,
-            CASE
-                WHEN trim(COALESCE(name, '')) <> '' THEN substr(replace(replace(name, char(10), ' '), char(13), ' '), 1, 80)
-                WHEN trim(COALESCE(title, '')) <> '' THEN substr(replace(replace(title, char(10), ' '), char(13), ' '), 1, 80)
-                WHEN trim(COALESCE(preview, '')) <> '' THEN substr(replace(replace(preview, char(10), ' '), char(13), ' '), 1, 80)
-                ELSE substr(id, 1, 8)
-            END AS display_name,
-            cwd,
-            CASE WHEN recency_at > 0 THEN recency_at ELSE updated_at END AS recency_at
-        FROM threads
-        WHERE archived = 0
-          AND source = 'cli'
-          AND (
-              trim(COALESCE(name, '')) <> ''
-              OR trim(COALESCE(title, '')) <> ''
-              OR trim(COALESCE(preview, '')) <> ''
-          )
-        ORDER BY recency_at DESC, id DESC
-        LIMIT \(safeLimit);
-        """
+        let query = CodexSessionQuery.recent(limit: limit)
 
         let result = CommandRunner.run(
             executable: URL(fileURLWithPath: "/usr/bin/sqlite3"),
@@ -195,33 +282,27 @@ enum CodexRemoteBridge {
     }
 
     static func activeSessions(limit: Int = 6) -> [CodexSession] {
+        let loadedSessions = loadedSessions(limit: 20)
+        let processes = CodexProcessInspector.liveProcesses(includeWorkingDirectories: true)
+        let resolved = CodexProcessInspector.resolvedSessionProcesses(
+            sessions: loadedSessions,
+            processes: processes
+        )
+        let safeLimit = min(max(limit, 1), 20)
+        return Array(
+            loadedSessions
+                .filter { resolved[$0.id] != nil }
+                .prefix(safeLimit)
+        )
+    }
+
+    static func loadedSessions(limit: Int = 20) -> [CodexSession] {
         guard fileManager.fileExists(atPath: stateDatabaseURL.path) else { return [] }
 
         let threadIDs = activeThreadIDs()
         guard !threadIDs.isEmpty else { return [] }
 
-        let safeLimit = min(max(limit, 1), 20)
-        let quotedIDs = threadIDs.map { "'\($0)'" }.joined(separator: ",")
-        let query = """
-        SELECT
-            id,
-            CASE
-                WHEN trim(COALESCE(name, '')) <> '' THEN substr(replace(replace(name, char(10), ' '), char(13), ' '), 1, 80)
-                WHEN trim(COALESCE(title, '')) <> '' THEN substr(replace(replace(title, char(10), ' '), char(13), ' '), 1, 80)
-                WHEN trim(COALESCE(preview, '')) <> '' THEN substr(replace(replace(preview, char(10), ' '), char(13), ' '), 1, 80)
-                ELSE substr(id, 1, 8)
-            END AS display_name,
-            cwd,
-            CASE WHEN recency_at > 0 THEN recency_at ELSE updated_at END AS recency_at
-        FROM threads
-        WHERE id IN (\(quotedIDs))
-          AND archived = 0
-          AND source = 'cli'
-          AND COALESCE(thread_source, 'user') = 'user'
-          AND trim(COALESCE(agent_role, '')) = ''
-        ORDER BY recency_at DESC, id DESC
-        LIMIT \(safeLimit);
-        """
+        let query = CodexSessionQuery.loaded(threadIDs: threadIDs, limit: limit)
 
         let result = CommandRunner.run(
             executable: URL(fileURLWithPath: "/usr/bin/sqlite3"),
@@ -236,10 +317,11 @@ enum CodexRemoteBridge {
     }
 
     static func discoveredProfiles(for sessions: [CodexSession]) -> [String: SessionProfile] {
-        CodexProcessInspector.resolvedProfiles(
-            activeSessionIDs: sessions.map(\.id),
-            processes: CodexProcessInspector.liveProcesses()
+        let resolved = CodexProcessInspector.resolvedSessionProcesses(
+            sessions: sessions,
+            processes: CodexProcessInspector.liveProcesses(includeWorkingDirectories: true)
         )
+        return resolved.mapValues(\.profile)
     }
 
     static func availableProfiles() -> [String] {
@@ -324,8 +406,8 @@ enum CodexRemoteBridge {
             return "Another app owns Remote Control"
         }
         if lowercased.contains("connection is errored") {
-            if chatGPTDesktopIsRunning() {
-                return "Connection failed; ChatGPT Desktop may own Remote"
+            if codexDesktopIsRunning() {
+                return "Connection failed; Codex Desktop may own Remote"
             }
             return "Remote connection failed"
         }
@@ -340,11 +422,21 @@ enum CodexRemoteBridge {
         return firstLine ?? "Remote Control command failed"
     }
 
-    private static func chatGPTDesktopIsRunning() -> Bool {
-        let result = CommandRunner.run(
-            executable: URL(fileURLWithPath: "/usr/bin/pgrep"),
-            arguments: ["-f", "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"]
-        )
-        return result.terminationStatus == 0
+    static func codexDesktopIsRunning() -> Bool {
+        let home = fileManager.homeDirectoryForCurrentUser
+        let executablePaths = [
+            "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+            "/Applications/Codex.app/Contents/MacOS/Codex",
+            home.appendingPathComponent("Applications/ChatGPT.app/Contents/MacOS/ChatGPT").path,
+            home.appendingPathComponent("Applications/Codex.app/Contents/MacOS/Codex").path
+        ]
+
+        return executablePaths.contains { executablePath in
+            let result = CommandRunner.run(
+                executable: URL(fileURLWithPath: "/usr/bin/pgrep"),
+                arguments: ["-f", executablePath]
+            )
+            return result.terminationStatus == 0
+        }
     }
 }

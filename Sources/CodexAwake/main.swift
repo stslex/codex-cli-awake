@@ -3,6 +3,14 @@ import Foundation
 import IOKit.pwr_mgt
 
 private let maximumVisibleSessions = 6
+private let maximumVisibleUsageLimits = 4
+private let screenshotPreviewUsageDetails = CommandLine.arguments.contains("--screenshot-preview-usage")
+private let screenshotPreviewSessionActions = CommandLine.arguments.contains("--screenshot-preview-session")
+private let screenshotPreviewEnabled = CommandLine.arguments.contains("--screenshot-preview")
+    || screenshotPreviewUsageDetails
+    || screenshotPreviewSessionActions
+    || screenshotPreviewUsageDetails
+    || screenshotPreviewSessionActions
 
 private enum AwakeMode: String, CaseIterable {
     case on
@@ -42,6 +50,12 @@ private enum AppUpdateState {
     case upToDate(latestVersion: AppVersion)
     case available(AppUpdateRelease)
     case installing(AppUpdateRelease)
+    case failed(String)
+}
+
+private enum CodexUsageState {
+    case loading
+    case loaded(CodexUsageSnapshot)
     case failed(String)
 }
 
@@ -104,26 +118,38 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     private let statusItem = NSStatusBar.system.statusItem(withLength: 22)
     private let menu = NSMenu()
+    private var usageStatusItems: [NSMenuItem] = []
+    private let remoteSourceItem = NSMenuItem(title: "Source", action: nil, keyEquivalent: "")
+    private let remoteSourceMenu = NSMenu(title: "Remote Source")
     private let remoteStatusItem = NSMenuItem(title: "Checking connection…", action: nil, keyEquivalent: "")
     private let remoteStartItem = NSMenuItem(title: "Start / Reconnect Remote Control", action: nil, keyEquivalent: "")
     private let recentSessionsItem = NSMenuItem(title: "Recent Sessions", action: nil, keyEquivalent: "")
     private let recentSessionsMenu = NSMenu(title: "Recent Sessions")
     private let awakeStatusItem = NSMenuItem(title: "Checking Codex sessions…", action: nil, keyEquivalent: "")
+    private let rejoinTerminalItem = NSMenuItem(title: "Rejoin Terminal", action: nil, keyEquivalent: "")
+    private let rejoinTerminalMenu = NSMenu(title: "Rejoin Terminal")
     private let launchAtLoginItem = NSMenuItem(title: "Launch at Login", action: nil, keyEquivalent: "")
     private let updateStatusItem = NSMenuItem(title: "Version", action: nil, keyEquivalent: "")
     private let updateActionItem = NSMenuItem(title: "Check for Updates…", action: nil, keyEquivalent: "")
     private let assertion = SleepAssertion()
     private let detectorQueue = DispatchQueue(label: "com.stslex.CodexAwake.session-detector", qos: .utility)
     private let remoteQueue = DispatchQueue(label: "com.stslex.CodexAwake.remote", qos: .utility)
+    private let usageQueue = DispatchQueue(label: "com.stslex.CodexAwake.usage", qos: .utility)
     private let updateQueue = DispatchQueue(label: "com.stslex.CodexAwake.updater", qos: .utility)
     private let relativeDateFormatter = RelativeDateTimeFormatter()
+    private let remoteSourceStore = RemoteControlSourceStore()
     private let profileStore = SessionProfileStore()
+    private let rejoinTerminalStore = RejoinTerminalStore()
     private let loginItemManager = LoginItemManager()
     private let updateClient = AppUpdateClient()
 
     private var modeItems: [AwakeMode: NSMenuItem] = [:]
+    private var remoteSourceItems: [RemoteControlSource: NSMenuItem] = [:]
+    private var rejoinTerminalItems: [TerminalProgram: NSMenuItem] = [:]
     private var activeSessionItems: [NSMenuItem] = []
     private var currentMode: AwakeMode = .activeSession
+    private var remoteSource: RemoteControlSource = .terminalCLI
+    private var usageState = CodexUsageState.loading
     private var remoteStatus = RemoteStatus.checking
     private var loginItemStatus = LoginItemStatus(state: .notRegistered, desired: true, detail: nil)
     private var updateState = AppUpdateState.idle
@@ -134,10 +160,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var sessionsLoaded = false
     private var scanInProgress = false
     private var remoteWorkInProgress = false
+    private var usageWorkInProgress = false
     private var lastRemoteRefresh: Date?
+    private var lastUsageRefresh: Date?
     private var lastUpdateCheck: Date?
     private var sessionTimer: Timer?
     private var remoteTimer: Timer?
+    private var usageTimer: Timer?
+    private var screenshotBackdropWindow: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -145,11 +175,22 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             size: NSSize(width: 256, height: 256)
         )
         relativeDateFormatter.unitsStyle = .abbreviated
+        remoteSource = screenshotPreviewEnabled ? .terminalCLI : remoteSourceStore.source
         configureMenu()
+
+        if screenshotPreviewEnabled {
+            configureScreenshotPreview()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                self?.openScreenshotPreviewMenu()
+            }
+            return
+        }
+
         loadMode()
         loginItemStatus = loginItemManager.reconcile()
         applyMode()
         scanForSessions()
+        refreshUsage(force: true)
         refreshRemoteAndSessions(force: true)
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
@@ -167,17 +208,31 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
         RunLoop.main.add(remoteTimer, forMode: .common)
         self.remoteTimer = remoteTimer
+
+        let usageTimer = Timer(timeInterval: 300.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.refreshUsage(force: true) }
+        }
+        RunLoop.main.add(usageTimer, forMode: .common)
+        self.usageTimer = usageTimer
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         sessionTimer?.invalidate()
         remoteTimer?.invalidate()
+        usageTimer?.invalidate()
         assertion.setHeld(false)
     }
 
     func menuWillOpen(_ menu: NSMenu) {
+        if screenshotPreviewEnabled {
+            updatePresentation()
+            applyScreenshotPreviewVisibility()
+            return
+        }
+
         loginItemStatus = loginItemManager.status()
         scanForSessions()
+        refreshUsage(force: false)
         refreshRemoteAndSessions(force: false)
         checkForUpdatesIfNeeded()
         updatePresentation()
@@ -188,7 +243,35 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         menu.minimumWidth = 340
         menu.delegate = self
 
+        menu.addItem(sectionHeader("USAGE"))
+        for _ in 0..<maximumVisibleUsageLimits {
+            let item = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+            configureStatusItem(item)
+            item.isHidden = true
+            usageStatusItems.append(item)
+            menu.addItem(item)
+        }
+
+        menu.addItem(.separator())
         menu.addItem(sectionHeader("REMOTE CONTROL"))
+
+        remoteSourceItem.image = menuSymbol("point.3.connected.trianglepath.dotted")
+        remoteSourceItem.isEnabled = true
+        remoteSourceItem.submenu = remoteSourceMenu
+        for source in RemoteControlSource.allCases {
+            let item = NSMenuItem(
+                title: source.title,
+                action: #selector(selectRemoteControlSource(_:)),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.tag = source.selectionTag
+            item.isEnabled = true
+            remoteSourceMenu.addItem(item)
+            remoteSourceItems[source] = item
+        }
+        menu.addItem(remoteSourceItem)
+
         configureStatusItem(remoteStatusItem)
         menu.addItem(remoteStatusItem)
 
@@ -229,6 +312,24 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
         menu.addItem(.separator())
         menu.addItem(sectionHeader("APP"))
+
+        rejoinTerminalItem.image = menuSymbol("terminal")
+        rejoinTerminalItem.isEnabled = true
+        rejoinTerminalItem.submenu = rejoinTerminalMenu
+        for terminal in TerminalProgram.selectablePrograms {
+            let item = NSMenuItem(
+                title: terminal.displayName,
+                action: #selector(selectRejoinTerminal(_:)),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.tag = terminal.selectionTag
+            item.isEnabled = true
+            rejoinTerminalMenu.addItem(item)
+            rejoinTerminalItems[terminal] = item
+        }
+        menu.addItem(rejoinTerminalItem)
+
         launchAtLoginItem.target = self
         launchAtLoginItem.action = #selector(toggleLaunchAtLogin)
         launchAtLoginItem.isEnabled = true
@@ -255,6 +356,183 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
         statusItem.menu = menu
         updatePresentation()
+    }
+
+    private func configureScreenshotPreview() {
+        if let screen = NSScreen.main {
+            let backdropSize = NSSize(width: 1_100, height: 680)
+            let backdropFrame = NSRect(
+                x: screen.frame.maxX - backdropSize.width,
+                y: screen.frame.maxY - backdropSize.height,
+                width: backdropSize.width,
+                height: backdropSize.height
+            )
+            let backdrop = NSWindow(
+                contentRect: backdropFrame,
+                styleMask: [.borderless],
+                backing: .buffered,
+                defer: false
+            )
+            backdrop.backgroundColor = .windowBackgroundColor
+            backdrop.isOpaque = true
+            backdrop.hasShadow = false
+            backdrop.ignoresMouseEvents = true
+            backdrop.collectionBehavior = [.canJoinAllSpaces, .stationary]
+            backdrop.orderFrontRegardless()
+            screenshotBackdropWindow = backdrop
+        }
+
+        usageState = .loaded(
+            CodexUsageSnapshot(
+                limits: [
+                    CodexUsageLimit(
+                        limitID: "codex",
+                        limitName: nil,
+                        primary: CodexUsageWindow(
+                            usedPercent: 22,
+                            windowDurationMins: 10_080,
+                            resetsAt: 1_788_424_200
+                        ),
+                        secondary: nil,
+                        credits: CodexUsageCredits(hasCredits: false, unlimited: false, balance: "0"),
+                        planType: "pro",
+                        rateLimitReachedType: nil
+                    ),
+                    CodexUsageLimit(
+                        limitID: "codex_bengalfox",
+                        limitName: "GPT-5.3-Codex-Spark",
+                        primary: CodexUsageWindow(
+                            usedPercent: 8,
+                            windowDurationMins: 300,
+                            resetsAt: 1_788_089_400
+                        ),
+                        secondary: CodexUsageWindow(
+                            usedPercent: 36,
+                            windowDurationMins: 10_080,
+                            resetsAt: 1_788_251_400
+                        ),
+                        credits: nil,
+                        planType: "pro",
+                        rateLimitReachedType: nil
+                    )
+                ],
+                availableResetCredits: 1
+            )
+        )
+        remoteStatus = RemoteStatus(
+            state: .connected,
+            serverName: "MacBook",
+            environmentID: "preview",
+            detail: nil,
+            configuredEnabled: true
+        )
+        let now = Int64(Date().timeIntervalSince1970)
+        activeSessions = [
+            CodexSession(
+                id: "preview-auth",
+                displayName: "Improve authentication flow",
+                cwd: "/Users/codex/Projects/sample-app",
+                recencyAt: now
+            ),
+            CodexSession(
+                id: "preview-release",
+                displayName: "Document the release process",
+                cwd: "/Users/codex/Projects/codex-cli-awake",
+                recencyAt: now - 180
+            ),
+            CodexSession(
+                id: "preview-tests",
+                displayName: "Add regression coverage for session loading",
+                cwd: "/Users/codex/Projects/desktop-tools",
+                recencyAt: now - 360
+            )
+        ]
+        activeSessionProcesses = Dictionary(
+            uniqueKeysWithValues: activeSessions.enumerated().map { index, session in
+                (
+                    session.id,
+                    InteractiveCodexProcess(
+                        pid: 10_000 + index,
+                        tty: "ttys00\(index)",
+                        command: "codex",
+                        workingDirectory: session.cwd,
+                        sessionID: session.id,
+                        profile: .defaultProfile
+                    )
+                )
+            }
+        )
+        recentSessions = [
+            CodexSession(
+                id: "preview-readme",
+                displayName: "Refresh README screenshots",
+                cwd: "/Users/codex/Projects/codex-cli-awake",
+                recencyAt: now - 3_600
+            )
+        ]
+        activeSessionCount = 3
+        sessionsLoaded = true
+        loginItemStatus = LoginItemStatus(state: .enabled, desired: true, detail: nil)
+        currentMode = .activeSession
+        assertion.setHeld(true)
+        updatePresentation()
+        applyScreenshotPreviewVisibility()
+    }
+
+    private func applyScreenshotPreviewVisibility() {
+        if screenshotPreviewUsageDetails {
+            let visibleUsageItems = usageStatusItems.filter { !$0.isHidden }
+            menu.items.forEach { $0.isHidden = true }
+            menu.items.first(where: { $0.title == "USAGE" })?.isHidden = false
+            visibleUsageItems.forEach { $0.isHidden = false }
+        }
+        if screenshotPreviewSessionActions {
+            let visibleSessionItems = activeSessionItems.filter { !$0.isHidden }
+            menu.items.forEach { $0.isHidden = true }
+            let spacer = menu.items[0]
+            spacer.attributedTitle = NSAttributedString(string: " ")
+            spacer.isHidden = false
+            menu.items.first(where: { $0.title == "ACTIVE SESSIONS" })?.isHidden = false
+            for item in visibleSessionItems {
+                item.toolTip = nil
+                item.isHidden = false
+            }
+            recentSessionsItem.isHidden = false
+        }
+    }
+
+    private func openScreenshotPreviewMenu() {
+        guard let button = statusItem.button else { return }
+
+        let verticalOffset: CGFloat?
+        if screenshotPreviewUsageDetails {
+            verticalOffset = 36
+        } else if screenshotPreviewSessionActions {
+            verticalOffset = 70
+        } else {
+            verticalOffset = nil
+        }
+
+        if let verticalOffset,
+           let window = button.window,
+           let screen = window.screen ?? NSScreen.main {
+            let buttonRect = window.convertToScreen(button.convert(button.bounds, to: nil))
+            let point = CGPoint(
+                x: buttonRect.minX + 170,
+                y: screen.frame.maxY - buttonRect.minY + verticalOffset
+            )
+            DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + 0.6) {
+                CGWarpMouseCursorPosition(point)
+                CGEvent(
+                    mouseEventSource: nil,
+                    mouseType: .mouseMoved,
+                    mouseCursorPosition: point,
+                    mouseButton: .left
+                )?.post(tap: .cghidEventTap)
+            }
+        }
+
+        button.performClick(nil)
     }
 
     private func sectionHeader(_ title: String) -> NSMenuItem {
@@ -300,8 +578,33 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         scanForSessions()
     }
 
+    @objc private func selectRejoinTerminal(_ sender: NSMenuItem) {
+        guard let terminal = TerminalProgram(selectionTag: sender.tag) else { return }
+        rejoinTerminalStore.set(terminal)
+        updatePresentation()
+    }
+
+    @objc private func selectRemoteControlSource(_ sender: NSMenuItem) {
+        guard !remoteWorkInProgress,
+              let selectedSource = RemoteControlSource(selectionTag: sender.tag),
+              selectedSource != remoteSource else {
+            return
+        }
+
+        switch selectedSource {
+        case .terminalCLI:
+            switchRemoteControlToTerminal()
+        case .codexDesktop:
+            switchRemoteControlToDesktop()
+        }
+    }
+
     @objc private func startRemoteControl() {
         guard !remoteWorkInProgress else { return }
+        guard remoteSource == .terminalCLI else {
+            showCodexDesktopRemoteInstructions()
+            return
+        }
         remoteStatus = RemoteStatus(
             state: .connecting,
             serverName: remoteStatus.serverName,
@@ -313,9 +616,123 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         refreshRemoteAndSessions(force: true)
     }
 
+    private func switchRemoteControlToTerminal() {
+        let alert = appAlert(style: .warning)
+        alert.messageText = "Switch Remote Control to Terminal CLI?"
+        alert.informativeText = "First turn off Allow connections in Codex Desktop under Settings > Connections > Control this Mac. Codex Awake will then start and maintain the Terminal CLI host."
+        alert.addButton(withTitle: "Switch to Terminal CLI")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        remoteSource = .terminalCLI
+        remoteSourceStore.set(remoteSource)
+        remoteStatus = RemoteStatus(
+            state: .connecting,
+            serverName: nil,
+            environmentID: nil,
+            detail: "Connecting Terminal CLI…",
+            configuredEnabled: true
+        )
+        updatePresentation()
+        refreshRemoteAndSessions(force: true)
+    }
+
+    private func switchRemoteControlToDesktop() {
+        guard codexDesktopApplicationURL() != nil else {
+            showError("Codex Desktop could not be found. Install the latest Codex Desktop app before releasing the Terminal CLI Remote host.")
+            return
+        }
+
+        let alert = appAlert(style: .warning)
+        alert.messageText = "Switch Remote Control to Codex Desktop?"
+        alert.informativeText = "Codex Awake must stop the Terminal CLI Remote host before Codex Desktop can claim it. This can disconnect TUI clients attached through the shared CLI daemon."
+        alert.addButton(withTitle: "Stop CLI and Switch")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        remoteSource = .codexDesktop
+        remoteSourceStore.set(remoteSource)
+        remoteWorkInProgress = true
+        remoteStatus = RemoteStatus(
+            state: .connecting,
+            serverName: nil,
+            environmentID: nil,
+            detail: "Stopping Terminal CLI host…",
+            configuredEnabled: true
+        )
+        updatePresentation()
+
+        remoteQueue.async { [weak self] in
+            let error = CodexRemoteBridge.stopTerminalRemoteControl()
+            let status = CodexRemoteBridge.desktopManagedStatus(
+                isDesktopRunning: CodexRemoteBridge.codexDesktopIsRunning()
+            )
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.remoteWorkInProgress = false
+                if let error {
+                    self.remoteSource = .terminalCLI
+                    self.remoteSourceStore.set(.terminalCLI)
+                    self.remoteStatus = RemoteStatus(
+                        state: .errored,
+                        serverName: nil,
+                        environmentID: nil,
+                        detail: error,
+                        configuredEnabled: true
+                    )
+                    self.updatePresentation()
+                    self.showError("Could not stop the Terminal CLI Remote host:\n\(error)")
+                    return
+                }
+
+                self.remoteStatus = status
+                self.lastRemoteRefresh = Date()
+                self.updatePresentation()
+                self.showCodexDesktopRemoteInstructions()
+            }
+        }
+    }
+
+    private func showCodexDesktopRemoteInstructions() {
+        let alert = appAlert()
+        alert.messageText = "Finish in Codex Desktop"
+        alert.informativeText = "Open Settings > Connections > Control this Mac and turn on Allow connections. If it is already on, turn it off and on again so Codex Desktop claims the released Remote host."
+        alert.addButton(withTitle: "Open Codex")
+        alert.addButton(withTitle: "Later")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        openCodexDesktop()
+    }
+
+    private func openCodexDesktop() {
+        let workspace = NSWorkspace.shared
+        guard let appURL = codexDesktopApplicationURL(),
+              workspace.open(appURL) else {
+            showError("Codex Desktop could not be opened. Open it manually, then configure Remote Control under Settings > Connections.")
+            return
+        }
+    }
+
+    private func codexDesktopApplicationURL() -> URL? {
+        let workspace = NSWorkspace.shared
+        let fileManager = FileManager.default
+        let home = fileManager.homeDirectoryForCurrentUser
+        let fallbackCandidates = [
+            URL(fileURLWithPath: "/Applications/ChatGPT.app"),
+            URL(fileURLWithPath: "/Applications/Codex.app"),
+            home.appendingPathComponent("Applications/ChatGPT.app"),
+            home.appendingPathComponent("Applications/Codex.app")
+        ]
+        return workspace.urlForApplication(withBundleIdentifier: "com.openai.codex")
+            ?? fallbackCandidates.first(where: { fileManager.fileExists(atPath: $0.path) })
+    }
+
     @objc private func refreshNow() {
         loginItemStatus = loginItemManager.status()
         scanForSessions()
+        refreshUsage(force: true)
         refreshRemoteAndSessions(force: true)
         updatePresentation()
     }
@@ -376,12 +793,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             )
             DispatchQueue.main.async {
                 guard let self else { return }
-                if result.terminationStatus != 0 {
-                    self.showError(
-                        result.combinedOutput.isEmpty
-                            ? "The terminal for this Codex session could not be focused."
-                            : result.combinedOutput
-                    )
+                switch result {
+                case .focused:
+                    break
+                case .surfaceUnavailable:
+                    self.offerToRejoinSession(session)
+                case let .failed(message):
+                    self.showError(message)
                 }
             }
         }
@@ -390,6 +808,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     @objc private func resumeSession(_ sender: NSMenuItem) {
         guard let session = sender.representedObject as? CodexSession else { return }
         launchSession(session, action: .resume)
+    }
+
+    @objc private func rejoinSession(_ sender: NSMenuItem) {
+        guard let session = sender.representedObject as? CodexSession else { return }
+        launchSession(session, action: .rejoin)
     }
 
     @objc private func forkSession(_ sender: NSMenuItem) {
@@ -453,6 +876,19 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         NSApp.terminate(nil)
     }
 
+    private func offerToRejoinSession(_ session: CodexSession) {
+        let terminal = rejoinTerminalStore.program
+        let alert = appAlert()
+        alert.messageText = "Original terminal is no longer available"
+        alert.informativeText = "“\(session.displayName)” is still running, but its original terminal surface no longer exists. Rejoin the same Codex session in \(terminal.displayName)? The existing Codex process will not be stopped."
+        alert.addButton(withTitle: "Rejoin in \(terminal.displayName)")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        launchSession(session, action: .rejoin)
+    }
+
     private func launchSession(_ session: CodexSession, action: SessionTerminalAction) {
         let profile: SessionProfile
         if let storedProfile = profileStore.profile(for: session.id) {
@@ -461,7 +897,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             guard let selectedProfile = promptForProfile(
                 session: session,
                 current: nil,
-                confirmationTitle: action == .resume ? "Resume" : "Fork"
+                confirmationTitle: action.confirmationTitle
             ) else {
                 return
             }
@@ -482,9 +918,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             arguments: arguments,
             workingDirectory: session.cwd
         )
+        let terminal = action.launchTerminal(rejoinTerminal: rejoinTerminalStore.program)
 
         detectorQueue.async { [weak self] in
-            let result = TerminalLauncher.launch(script: script)
+            let result = TerminalLauncher.launch(script: script, terminal: terminal)
             DispatchQueue.main.async {
                 guard let self else { return }
                 if result.terminationStatus != 0 {
@@ -613,8 +1050,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             ? "Install the signed Codex Awake \(release.version) release?"
             : "Install Codex Awake \(release.version)?"
         var detail = replacesSourceBuild
-            ? "This source-built copy will be replaced by the Developer ID-signed and notarized release of the same version. The release will be downloaded from GitHub, verified, installed, and then Codex Awake will relaunch. Active Codex CLI sessions and the Remote Control daemon will keep running."
-            : "The notarized update will be downloaded from GitHub, verified, installed, and then Codex Awake will relaunch. Active Codex CLI sessions and the Remote Control daemon will keep running."
+            ? "This source-built copy will be replaced by the Developer ID-signed and notarized release of the same version. The release will be downloaded from GitHub, verified, installed, and then Codex Awake will relaunch. Active Codex CLI sessions and the selected Remote Control owner will not be stopped."
+            : "The notarized update will be downloaded from GitHub, verified, installed, and then Codex Awake will relaunch. Active Codex CLI sessions and the selected Remote Control owner will not be stopped."
         if let notes = release.releaseNotes,
            !notes.isEmpty {
             detail += "\n\n" + compact(notes, maximumLength: 900)
@@ -699,21 +1136,24 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         guard !remoteWorkInProgress else { return }
         remoteWorkInProgress = true
         updatePresentation()
+        let source = remoteSource
 
         remoteQueue.async { [weak self] in
-            let status = CodexRemoteBridge.ensureRemoteStarted()
-            let activeSessions = CodexRemoteBridge.activeSessions(limit: maximumVisibleSessions)
-            let liveProcesses = CodexProcessInspector.liveProcesses()
-            let activeSessionIDs = activeSessions.map(\.id)
-            let discoveredProfiles = CodexProcessInspector.resolvedProfiles(
-                activeSessionIDs: activeSessionIDs,
+            let status = RemoteControlSourceResolver.status(for: source)
+            let loadedSessions = CodexRemoteBridge.loadedSessions(limit: 20)
+            let liveProcesses = CodexProcessInspector.liveProcesses(includeWorkingDirectories: true)
+            let resolvedProcesses = CodexProcessInspector.resolvedSessionProcesses(
+                sessions: loadedSessions,
                 processes: liveProcesses
             )
-            let activeSessionProcesses = CodexProcessInspector.resolvedProcesses(
-                activeSessionIDs: activeSessionIDs,
-                processes: liveProcesses
+            let activeSessions = Array(
+                loadedSessions
+                    .filter { resolvedProcesses[$0.id] != nil }
+                    .prefix(maximumVisibleSessions)
             )
             let activeIDs = Set(activeSessions.map(\.id))
+            let activeSessionProcesses = resolvedProcesses.filter { activeIDs.contains($0.key) }
+            let discoveredProfiles = activeSessionProcesses.mapValues(\.profile)
             let recentSessions = CodexRemoteBridge
                 .recentSessions(limit: maximumVisibleSessions + activeIDs.count)
                 .filter { !activeIDs.contains($0.id) }
@@ -735,6 +1175,34 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
     }
 
+    private func refreshUsage(force: Bool) {
+        if !force,
+           let lastUsageRefresh,
+           Date().timeIntervalSince(lastUsageRefresh) < 60.0 {
+            return
+        }
+        guard !usageWorkInProgress else { return }
+        usageWorkInProgress = true
+        updatePresentation()
+
+        usageQueue.async { [weak self] in
+            let newState: CodexUsageState
+            do {
+                newState = .loaded(try CodexUsageBridge.fetch())
+            } catch {
+                newState = .failed(error.localizedDescription)
+            }
+
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.usageWorkInProgress = false
+                self.usageState = newState
+                self.lastUsageRefresh = Date()
+                self.updatePresentation()
+            }
+        }
+    }
+
     private func applyMode() {
         let shouldHoldAssertion: Bool
         switch currentMode {
@@ -751,9 +1219,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     private func updatePresentation() {
+        updateUsagePresentation()
         updateRemotePresentation()
         updateSessionPresentation()
         updateAwakePresentation()
+        updateRejoinTerminalPresentation()
         updateLoginItemPresentation()
         updateUpdatePresentation()
 
@@ -762,9 +1232,77 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             assertionActive: assertion.isHeld,
             remoteConnected: remoteStatus.state == .connected
         )
-        let remoteLabel = remoteStatus.state == .connected ? "Remote connected" : "Remote \(remoteStatus.state.rawValue)"
+        let remoteLabel = remoteStatus.state == .managed
+            ? "Remote managed by Codex Desktop"
+            : (remoteStatus.state == .connected ? "Remote connected" : "Remote \(remoteStatus.state.rawValue)")
         button.toolTip = "Codex Awake — \(remoteLabel) · Awake \(currentMode.title.lowercased())"
         button.contentTintColor = nil
+    }
+
+    private func updateUsagePresentation() {
+        guard let firstItem = usageStatusItems.first else { return }
+
+        switch usageState {
+        case .loading:
+            firstItem.title = "Loading usage…"
+            firstItem.image = menuSymbol("arrow.triangle.2.circlepath")
+            firstItem.toolTip = nil
+            firstItem.submenu = nil
+            firstItem.isEnabled = false
+            firstItem.isHidden = false
+            for item in usageStatusItems.dropFirst() { item.isHidden = true }
+
+        case let .failed(detail):
+            firstItem.title = "Usage unavailable"
+            firstItem.image = menuSymbol("exclamationmark.triangle.fill")
+            firstItem.toolTip = detail
+            firstItem.submenu = nil
+            firstItem.isEnabled = false
+            firstItem.isHidden = false
+            for item in usageStatusItems.dropFirst() { item.isHidden = true }
+
+        case let .loaded(snapshot):
+            let presentations = CodexUsageMenuPresentation.make(snapshot: snapshot)
+            guard !presentations.isEmpty else {
+                firstItem.title = "No usage data"
+                firstItem.image = menuSymbol("questionmark.circle")
+                firstItem.toolTip = "Codex returned no rate-limit windows."
+                firstItem.submenu = nil
+                firstItem.isEnabled = false
+                firstItem.isHidden = false
+                for item in usageStatusItems.dropFirst() { item.isHidden = true }
+                return
+            }
+
+            for (index, item) in usageStatusItems.enumerated() {
+                guard index < presentations.count else {
+                    item.submenu = nil
+                    item.toolTip = nil
+                    item.isEnabled = false
+                    item.isHidden = true
+                    continue
+                }
+                let presentation = presentations[index]
+                item.title = presentation.title
+                item.image = menuSymbol(presentation.symbolName)
+                item.toolTip = nil
+                item.submenu = usageDetailsMenu(for: presentation)
+                item.isEnabled = true
+                item.isHidden = false
+            }
+        }
+    }
+
+    private func usageDetailsMenu(for presentation: CodexUsageMenuItemPresentation) -> NSMenu {
+        let detailsMenu = NSMenu(title: presentation.title)
+        detailsMenu.autoenablesItems = false
+        for detail in presentation.details {
+            let item = NSMenuItem(title: detail.title, action: nil, keyEquivalent: "")
+            item.image = menuSymbol(detail.symbolName)
+            item.isEnabled = false
+            detailsMenu.addItem(item)
+        }
+        return detailsMenu
     }
 
     private func updateRemotePresentation() {
@@ -783,6 +1321,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         case .connected:
             title = remoteStatus.serverName.map { "Connected · \($0)" } ?? "Connected"
             symbolName = "checkmark.circle.fill"
+        case .managed:
+            title = remoteStatus.detail ?? "Managed by Codex Desktop"
+            symbolName = "macwindow"
         case .errored:
             title = remoteStatus.detail.map { "Error · \($0)" } ?? "Connection error"
             symbolName = "exclamationmark.triangle.fill"
@@ -794,7 +1335,25 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         remoteStatusItem.image = menuSymbol(symbolName)
         remoteStatusItem.toolTip = remoteStatus.environmentID
 
-        remoteStartItem.title = remoteStatus.state == .connected ? "Reconnect Remote Control" : "Start / Reconnect Remote Control"
+        remoteSourceItem.title = "Source · \(remoteSource.title)"
+        remoteSourceItem.image = menuSymbol(
+            remoteSource == .terminalCLI ? "terminal" : "macwindow"
+        )
+        remoteSourceItem.isEnabled = !remoteWorkInProgress
+        for (source, item) in remoteSourceItems {
+            item.state = source == remoteSource ? .on : .off
+            item.isEnabled = !remoteWorkInProgress
+        }
+
+        if remoteSource == .codexDesktop {
+            remoteStartItem.title = "Open Codex Remote Settings…"
+            remoteStartItem.image = menuSymbol("macwindow")
+        } else {
+            remoteStartItem.title = remoteStatus.state == .connected
+                ? "Reconnect Remote Control"
+                : "Start / Reconnect Remote Control"
+            remoteStartItem.image = menuSymbol("antenna.radiowaves.left.and.right")
+        }
         remoteStartItem.isEnabled = !remoteWorkInProgress
     }
 
@@ -860,8 +1419,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     private func configureSessionItem(_ item: NSMenuItem, session: CodexSession, isActive: Bool) {
-        let projectName = URL(fileURLWithPath: session.cwd).lastPathComponent
-        item.title = "\(compact(session.displayName, maximumLength: 46)) · \(projectName)"
+        item.title = CodexSessionMenuPresentation.title(for: session)
         let date = Date(timeIntervalSince1970: TimeInterval(session.recencyAt))
         let relativeDate = relativeDateFormatter.localizedString(for: date, relativeTo: Date())
         let profile = profileStore.profile(for: session.id)?.displayName ?? "Unknown profile"
@@ -883,9 +1441,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             ))
         } else if isActive {
             actions.addItem(sessionActionItem(
-                title: "Open in Terminal",
+                title: "Rejoin in \(rejoinTerminalStore.program.displayName)",
                 symbol: "play.fill",
-                action: #selector(resumeSession(_:)),
+                action: #selector(rejoinSession(_:)),
                 session: session
             ))
         }
@@ -993,9 +1551,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             awakeStatusItem.title = "Error · \(error)"
             awakeStatusItem.image = menuSymbol("exclamationmark.triangle.fill")
         } else {
-            let assertionState = assertion.isHeld ? "On" : "Off"
-            let sessionWord = activeSessionCount == 1 ? "session" : "sessions"
-            awakeStatusItem.title = "\(assertionState) · \(activeSessionCount) active CLI \(sessionWord)"
+            let assertionState = assertion.isHeld ? "Preventing sleep" : "Sleep allowed"
+            let cliWord = activeSessionCount == 1 ? "CLI" : "CLIs"
+            awakeStatusItem.title = "\(assertionState) · \(activeSessionCount) interactive \(cliWord)"
             awakeStatusItem.image = menuSymbol(assertion.isHeld ? "bolt.circle.fill" : "moon.circle")
         }
     }
@@ -1003,9 +1561,18 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private func updateLoginItemPresentation() {
         let presentation = LoginItemMenuPresentation.make(status: loginItemStatus)
         launchAtLoginItem.title = presentation.title
-        launchAtLoginItem.image = menuSymbol(presentation.symbolName)
+        launchAtLoginItem.image = presentation.isChecked ? nil : menuSymbol(presentation.symbolName)
         launchAtLoginItem.state = presentation.isChecked ? .on : .off
         launchAtLoginItem.toolTip = loginItemStatus.detail
+    }
+
+    private func updateRejoinTerminalPresentation() {
+        let selectedTerminal = rejoinTerminalStore.program
+        rejoinTerminalItem.title = "Rejoin Terminal · \(selectedTerminal.displayName)"
+        rejoinTerminalItem.toolTip = "New Rejoin clients open in \(selectedTerminal.displayName)."
+        for (terminal, item) in rejoinTerminalItems {
+            item.state = terminal == selectedTerminal ? .on : .off
+        }
     }
 
     private func updateUpdatePresentation() {
@@ -1156,6 +1723,15 @@ if arguments.contains("--check-for-updates") {
         exit(EXIT_SUCCESS)
     } catch {
         printJSON(AppUpdateCommandStatus.failure(currentVersion: currentVersion, error: error))
+        exit(EXIT_FAILURE)
+    }
+}
+if arguments.contains("--usage") {
+    do {
+        printJSON(try CodexUsageBridge.fetch())
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("Could not read Codex usage: \(error.localizedDescription)\n", stderr)
         exit(EXIT_FAILURE)
     }
 }

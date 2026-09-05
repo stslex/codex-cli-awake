@@ -64,8 +64,36 @@ struct InteractiveCodexProcess: Equatable {
     let pid: Int
     let tty: String
     let command: String
+    let workingDirectory: String?
     let sessionID: String?
     let profile: SessionProfile
+
+    init(
+        pid: Int,
+        tty: String,
+        command: String,
+        workingDirectory: String? = nil,
+        sessionID: String?,
+        profile: SessionProfile
+    ) {
+        self.pid = pid
+        self.tty = tty
+        self.command = command
+        self.workingDirectory = workingDirectory
+        self.sessionID = sessionID
+        self.profile = profile
+    }
+
+    func withWorkingDirectory(_ workingDirectory: String?) -> InteractiveCodexProcess {
+        InteractiveCodexProcess(
+            pid: pid,
+            tty: tty,
+            command: command,
+            workingDirectory: workingDirectory,
+            sessionID: sessionID,
+            profile: profile
+        )
+    }
 }
 
 enum CodexProcessInspector {
@@ -74,13 +102,19 @@ enum CodexProcessInspector {
         options: [.caseInsensitive]
     )
 
-    static func liveProcesses() -> [InteractiveCodexProcess] {
+    static func liveProcesses(includeWorkingDirectories: Bool = false) -> [InteractiveCodexProcess] {
         let result = CommandRunner.run(
             executable: URL(fileURLWithPath: "/bin/ps"),
             arguments: ["-axo", "pid=,tty=,command="]
         )
         guard result.terminationStatus == 0 else { return [] }
-        return parse(processList: result.standardOutput)
+        let processes = parse(processList: result.standardOutput)
+        guard includeWorkingDirectories, !processes.isEmpty else { return processes }
+
+        let directories = workingDirectories(for: processes.map(\.pid))
+        return processes.map { process in
+            process.withWorkingDirectory(directories[process.pid])
+        }
     }
 
     static func parse(processList: String) -> [InteractiveCodexProcess] {
@@ -173,6 +207,96 @@ enum CodexProcessInspector {
         return result
     }
 
+    static func resolvedSessionProcesses(
+        sessions: [CodexSession],
+        processes: [InteractiveCodexProcess]
+    ) -> [String: InteractiveCodexProcess] {
+        let sessionsByID = Dictionary(uniqueKeysWithValues: sessions.map { ($0.id, $0) })
+        let sessionsByRecency = sessions.sorted {
+            if $0.recencyAt == $1.recencyAt { return $0.id > $1.id }
+            return $0.recencyAt > $1.recencyAt
+        }
+        var unresolvedSessionIDs = Set(sessions.map(\.id))
+        var resolved: [String: InteractiveCodexProcess] = [:]
+        var assignedProcessIDs = Set<Int>()
+
+        for process in processes {
+            guard let sessionID = process.sessionID,
+                  sessionsByID[sessionID] != nil,
+                  unresolvedSessionIDs.contains(sessionID) else {
+                continue
+            }
+            resolved[sessionID] = process
+            unresolvedSessionIDs.remove(sessionID)
+            assignedProcessIDs.insert(process.pid)
+        }
+
+        for process in processes where process.sessionID == nil {
+            guard let processDirectory = process.workingDirectory else { continue }
+            let normalizedProcessDirectory = normalizedPath(processDirectory)
+            guard let session = sessionsByRecency.first(where: {
+                unresolvedSessionIDs.contains($0.id)
+                    && normalizedPath($0.cwd) == normalizedProcessDirectory
+            }) else {
+                continue
+            }
+            resolved[session.id] = process
+            unresolvedSessionIDs.remove(session.id)
+            assignedProcessIDs.insert(process.pid)
+        }
+
+        let remainingSessions = sessionsByRecency.filter { unresolvedSessionIDs.contains($0.id) }
+        let remainingProcesses = processes.filter {
+            $0.sessionID == nil && !assignedProcessIDs.contains($0.pid)
+        }
+        if remainingSessions.count == 1,
+           remainingProcesses.count == 1,
+           let session = remainingSessions.first,
+           let process = remainingProcesses.first,
+           process.workingDirectory == nil {
+            resolved[session.id] = process
+        }
+
+        return resolved
+    }
+
+    static func parseWorkingDirectories(output: String) -> [Int: String] {
+        var currentPID: Int?
+        var result: [Int: String] = [:]
+
+        for line in output.split(separator: "\n", omittingEmptySubsequences: true) {
+            guard let marker = line.first else { continue }
+            let value = String(line.dropFirst())
+            switch marker {
+            case "p":
+                currentPID = Int(value)
+            case "n":
+                if let currentPID, !value.isEmpty {
+                    result[currentPID] = value
+                }
+            default:
+                continue
+            }
+        }
+        return result
+    }
+
+    private static func workingDirectories(for processIDs: [Int]) -> [Int: String] {
+        guard !processIDs.isEmpty else { return [:] }
+        let result = CommandRunner.run(
+            executable: URL(fileURLWithPath: "/usr/sbin/lsof"),
+            arguments: [
+                "-nP", "-a", "-d", "cwd", "-F", "pn", "-p",
+                processIDs.map(String.init).joined(separator: ",")
+            ]
+        )
+        return parseWorkingDirectories(output: result.standardOutput)
+    }
+
+    private static func normalizedPath(_ path: String) -> String {
+        URL(fileURLWithPath: path).standardizedFileURL.path
+    }
+
     private static func isInteractiveCodexProcess(tty: String, command: String) -> Bool {
         guard let executable = command.split(whereSeparator: { $0.isWhitespace }).first else {
             return false
@@ -230,9 +354,39 @@ enum CodexProcessInspector {
     }
 }
 
-enum SessionTerminalAction: String {
+enum SessionTerminalAction {
     case resume
+    case rejoin
     case fork
+
+    var commandName: String {
+        switch self {
+        case .resume, .rejoin:
+            return "resume"
+        case .fork:
+            return "fork"
+        }
+    }
+
+    var confirmationTitle: String {
+        switch self {
+        case .resume:
+            return "Resume"
+        case .rejoin:
+            return "Rejoin"
+        case .fork:
+            return "Fork"
+        }
+    }
+
+    func launchTerminal(rejoinTerminal: TerminalProgram) -> TerminalProgram {
+        switch self {
+        case .rejoin:
+            return rejoinTerminal
+        case .resume, .fork:
+            return .appleTerminal
+        }
+    }
 }
 
 enum CodexSessionCommand {
@@ -245,7 +399,7 @@ enum CodexSessionCommand {
         if case let .named(name) = profile {
             arguments += ["--profile", name]
         }
-        arguments += [action.rawValue, sessionID]
+        arguments += [action.commandName, sessionID]
         return arguments
     }
 
@@ -255,21 +409,58 @@ enum CodexSessionCommand {
         workingDirectory: String
     ) -> String {
         let command = ([executablePath] + arguments)
-            .map(shellQuote)
+            .map(ShellEscaping.singleQuoted)
             .joined(separator: " ")
-        return "cd -- \(shellQuote(workingDirectory)) && exec \(command)"
+        return "cd -- \(ShellEscaping.singleQuoted(workingDirectory)) && exec \(command)"
     }
+}
 
-    private static func shellQuote(_ value: String) -> String {
+enum ShellEscaping {
+    static func singleQuoted(_ value: String) -> String {
         "'" + value.replacingOccurrences(of: "'", with: "'\"'\"'") + "'"
     }
 }
 
-enum TerminalProgram: Equatable {
+enum TerminalProgram: String, CaseIterable, Hashable {
     case ghostty
     case appleTerminal
     case iTerm2
     case unknown
+
+    static let selectablePrograms: [TerminalProgram] = [.ghostty, .appleTerminal, .iTerm2]
+
+    var displayName: String {
+        switch self {
+        case .ghostty:
+            return "Ghostty"
+        case .appleTerminal:
+            return "Terminal"
+        case .iTerm2:
+            return "iTerm2"
+        case .unknown:
+            return "Unknown Terminal"
+        }
+    }
+
+    var selectionTag: Int {
+        switch self {
+        case .ghostty:
+            return 0
+        case .appleTerminal:
+            return 1
+        case .iTerm2:
+            return 2
+        case .unknown:
+            return -1
+        }
+    }
+
+    init?(selectionTag: Int) {
+        guard let program = Self.selectablePrograms.first(where: { $0.selectionTag == selectionTag }) else {
+            return nil
+        }
+        self = program
+    }
 
     static func detect(in processEnvironment: String) -> TerminalProgram {
         if processEnvironment.contains("TERM_PROGRAM=ghostty") {
@@ -285,7 +476,48 @@ enum TerminalProgram: Equatable {
     }
 }
 
+final class RejoinTerminalStore {
+    private static let defaultsKey = "rejoinTerminal"
+    private let defaults: UserDefaults
+    private let defaultProgram: TerminalProgram
+
+    init(
+        defaults: UserDefaults = .standard,
+        defaultProgram: TerminalProgram = .appleTerminal
+    ) {
+        self.defaults = defaults
+        self.defaultProgram = defaultProgram
+    }
+
+    var program: TerminalProgram {
+        guard let storedValue = defaults.string(forKey: Self.defaultsKey),
+              let storedProgram = TerminalProgram(rawValue: storedValue),
+              TerminalProgram.selectablePrograms.contains(storedProgram) else {
+            return defaultProgram
+        }
+        return storedProgram
+    }
+
+    func set(_ program: TerminalProgram) {
+        guard TerminalProgram.selectablePrograms.contains(program) else { return }
+        defaults.set(program.rawValue, forKey: Self.defaultsKey)
+    }
+}
+
+enum TerminalFocusOutcome: Equatable {
+    case focused
+    case surfaceUnavailable(String)
+    case failed(String)
+}
+
 enum TerminalSessionFocuser {
+    private static let appleTerminalSurfaceUnavailableMessage =
+        "The Terminal tab for this Codex session is no longer open."
+    private static let ghosttySurfaceUnavailableMessage =
+        "The Ghostty surface for this Codex session is no longer open."
+    private static let iTermSurfaceUnavailableMessage =
+        "The iTerm2 session for this Codex session is no longer open."
+
     typealias Runner = (URL, [String]) -> CommandResult
     typealias TerminalWriter = (String, String) -> String?
 
@@ -295,9 +527,9 @@ enum TerminalSessionFocuser {
         sessionName: String,
         runner: Runner = CommandRunner.run,
         terminalWriter: TerminalWriter = writeToTerminal
-    ) -> CommandResult {
+    ) -> TerminalFocusOutcome {
         guard let ttyPath = ttyDevicePath(process.tty) else {
-            return failure("The active Codex process does not have a valid TTY.")
+            return .failed("The active Codex process does not have a valid TTY.")
         }
 
         let environment = runner(
@@ -305,7 +537,7 @@ enum TerminalSessionFocuser {
             ["eww", "-p", String(process.pid), "-o", "command="]
         )
         guard environment.terminationStatus == 0 else {
-            return failure(
+            return .failed(
                 environment.combinedOutput.isEmpty
                     ? "The terminal app for this Codex process could not be identified."
                     : environment.combinedOutput
@@ -314,25 +546,34 @@ enum TerminalSessionFocuser {
 
         switch TerminalProgram.detect(in: environment.standardOutput) {
         case .ghostty:
-            return focusGhostty(
-                ttyPath: ttyPath,
-                sessionID: sessionID,
-                sessionName: sessionName,
-                runner: runner,
-                terminalWriter: terminalWriter
+            return classify(
+                focusGhostty(
+                    ttyPath: ttyPath,
+                    sessionID: sessionID,
+                    sessionName: sessionName,
+                    runner: runner,
+                    terminalWriter: terminalWriter
+                ),
+                surfaceUnavailableMessage: ghosttySurfaceUnavailableMessage
             )
         case .appleTerminal:
-            return runner(
-                URL(fileURLWithPath: "/usr/bin/osascript"),
-                ["-e", appleTerminalFocusScript(ttyPath: ttyPath)]
+            return classify(
+                runner(
+                    URL(fileURLWithPath: "/usr/bin/osascript"),
+                    ["-e", appleTerminalFocusScript(ttyPath: ttyPath)]
+                ),
+                surfaceUnavailableMessage: appleTerminalSurfaceUnavailableMessage
             )
         case .iTerm2:
-            return runner(
-                URL(fileURLWithPath: "/usr/bin/osascript"),
-                ["-e", iTermFocusScript(ttyPath: ttyPath)]
+            return classify(
+                runner(
+                    URL(fileURLWithPath: "/usr/bin/osascript"),
+                    ["-e", iTermFocusScript(ttyPath: ttyPath)]
+                ),
+                surfaceUnavailableMessage: iTermSurfaceUnavailableMessage
             )
         case .unknown:
-            return failure("The active session's terminal app is not supported yet.")
+            return .failed("The active session's terminal app is not supported yet.")
         }
     }
 
@@ -350,7 +591,7 @@ enum TerminalSessionFocuser {
                     end if
                 end repeat
             end repeat
-            error "The Terminal tab for this Codex session is no longer open." number 1
+            error "(appleTerminalSurfaceUnavailableMessage)" number 1
         end tell
         """
     }
@@ -367,7 +608,7 @@ enum TerminalSessionFocuser {
                 end if
                 delay 0.025
             end repeat
-            error "The Ghostty surface for this Codex session is no longer open." number 1
+            error "(ghosttySurfaceUnavailableMessage)" number 1
         end tell
         """
     }
@@ -388,7 +629,7 @@ enum TerminalSessionFocuser {
                     end repeat
                 end repeat
             end repeat
-            error "The iTerm2 session for this Codex session is no longer open." number 1
+            error "(iTermSurfaceUnavailableMessage)" number 1
         end tell
         """
     }
@@ -416,7 +657,7 @@ enum TerminalSessionFocuser {
         let marker = "Codex Awake · \(compactName) · \(sessionID.prefix(8)) · \(UUID().uuidString)"
 
         if let error = terminalWriter(ttyPath, titleProbeSequence(marker: marker)) {
-            return failure("Ghostty could not be addressed through \(ttyPath): \(error)")
+            return commandFailure("Ghostty could not be addressed through \(ttyPath): \(error)")
         }
         defer { _ = terminalWriter(ttyPath, restoreTitleSequence) }
 
@@ -424,6 +665,21 @@ enum TerminalSessionFocuser {
             URL(fileURLWithPath: "/usr/bin/osascript"),
             ["-e", ghosttyFocusScript(marker: marker)]
         )
+    }
+
+    private static func classify(
+        _ result: CommandResult,
+        surfaceUnavailableMessage: String
+    ) -> TerminalFocusOutcome {
+        guard result.terminationStatus != 0 else { return .focused }
+
+        let message = result.combinedOutput.isEmpty
+            ? "The terminal for this Codex session could not be focused."
+            : result.combinedOutput
+        if message.contains(surfaceUnavailableMessage) {
+            return .surfaceUnavailable(message)
+        }
+        return .failed(message)
     }
 
     private static func ttyDevicePath(_ tty: String) -> String? {
@@ -453,7 +709,7 @@ enum TerminalSessionFocuser {
         }
     }
 
-    private static func failure(_ message: String) -> CommandResult {
+    private static func commandFailure(_ message: String) -> CommandResult {
         CommandResult(
             terminationStatus: 1,
             standardOutput: "",
@@ -474,16 +730,72 @@ enum AppleScriptEscaping {
 }
 
 enum TerminalLauncher {
-    static func launch(script: String) -> CommandResult {
-        let appleScript = """
+    static func launch(script: String, terminal: TerminalProgram) -> CommandResult {
+        let appleScript: String
+        switch terminal {
+        case .ghostty:
+            appleScript = ghosttyLaunchScript(script: script)
+        case .appleTerminal:
+            appleScript = appleTerminalLaunchScript(script: script)
+        case .iTerm2:
+            appleScript = iTermLaunchScript(script: script)
+        case .unknown:
+            return CommandResult(
+                terminationStatus: 1,
+                standardOutput: "",
+                standardError: "Choose a supported default terminal for Rejoin."
+            )
+        }
+
+        return CommandRunner.run(
+            executable: URL(fileURLWithPath: "/usr/bin/osascript"),
+            arguments: ["-e", appleScript]
+        )
+    }
+
+    static func appleTerminalLaunchScript(script: String) -> String {
+        """
         tell application "Terminal"
             activate
             do script \(AppleScriptEscaping.stringLiteral(script))
         end tell
         """
-        return CommandRunner.run(
-            executable: URL(fileURLWithPath: "/usr/bin/osascript"),
-            arguments: ["-e", appleScript]
-        )
+    }
+
+    static func ghosttyLaunchScript(script: String) -> String {
+        let command = AppleScriptEscaping.stringLiteral(ghosttyCommand(script: script))
+        return """
+        tell application "Ghostty"
+            set launchConfiguration to new surface configuration from {command:\(command), wait after command:true}
+            if (count of windows) is 0 then
+                set launchWindow to new window with configuration launchConfiguration
+            else
+                set launchWindow to front window
+                set launchTab to new tab in launchWindow with configuration launchConfiguration
+                select tab launchTab
+            end if
+            activate window launchWindow
+            return "launched"
+        end tell
+        """
+    }
+
+    static func ghosttyCommand(script: String) -> String {
+        "/bin/zsh -lc \(ShellEscaping.singleQuoted(script))"
+    }
+
+    static func iTermLaunchScript(script: String) -> String {
+        let command = AppleScriptEscaping.stringLiteral(script)
+        return """
+        tell application "iTerm2"
+            activate
+            if (count of windows) is 0 then
+                create window with default profile command \(command)
+            else
+                tell current window to create tab with default profile command \(command)
+            end if
+            return "launched"
+        end tell
+        """
     }
 }
